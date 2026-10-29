@@ -1160,6 +1160,15 @@ def get_unified_home(
     # 8. Return the complete response.
     # -----------------------------------------------------
     return {
+        "user": {
+            "account_id": str(account_id),
+            "profile_id": str(profile.id),
+            "name": profile.name,
+            "avatar_url": profile.avatar_key,
+            "account_type": (
+                "Kids" if profile.is_kids_profile else "Adult"
+            ),
+        },
         "home": {
             "sliders": home_sliders,
         },

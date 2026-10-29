@@ -162,6 +162,7 @@ class PlatformLiveChannelCreate(BaseModel):
     channel_number: int | None = Field(default=None, gt=0)
 
     display_order: int = 0
+    category: str | None = None
     is_news_channel: bool = False
     is_active: bool = True
     metadata_json: dict[str, Any] = Field(default_factory=dict)

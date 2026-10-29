@@ -874,7 +874,7 @@ def get_unified_home(
     ]
 
     # -----------------------------------------------------
-    # 4. Preserve the existing live-TV response.
+    # 4. Return live-TV channels grouped by platform.
     # -----------------------------------------------------
     channel_rows = db.execute(
         select(PlatformLiveChannel, StreamingPlatform)
@@ -887,12 +887,13 @@ def get_unified_home(
             StreamingPlatform.is_active.is_(True),
         )
         .order_by(
+            StreamingPlatform.display_order.asc(),
             PlatformLiveChannel.display_order.asc(),
             PlatformLiveChannel.name.asc(),
         )
     ).all()
 
-    live_tv_channels = []
+    live_tv_by_platform = {}
 
     for channel, channel_platform in channel_rows:
         channel_is_available = (
@@ -901,12 +902,27 @@ def get_unified_home(
             and live_tv_enabled
         )
 
-        live_tv_channels.append({
+        platform_id = str(channel_platform.id)
+
+        if platform_id not in live_tv_by_platform:
+            live_tv_by_platform[platform_id] = {
+                "platform_id": platform_id,
+                "platform_name": channel_platform.name,
+                "platform_slug": channel_platform.slug,
+                "is_available": channel_is_available,
+                "availability_status": (
+                    "available"
+                    if channel_is_available
+                    else "not_included"
+                ),
+                "channels": [],
+            }
+
+        live_tv_by_platform[platform_id]["channels"].append({
             "id": str(channel.id),
             "name": channel.name,
             "logo_url": channel.logo_url,
-            "platform_id": str(channel_platform.id),
-            "platform_name": channel_platform.name,
+            "category": channel.category if channel.category else None,
             "is_available": channel_is_available,
             "availability_status": (
                 "available"
@@ -914,6 +930,13 @@ def get_unified_home(
                 else "not_included"
             ),
         })
+
+    live_tv_platforms = list(live_tv_by_platform.values())
+
+    live_tv_channel_count = sum(
+        len(platform["channels"])
+        for platform in live_tv_platforms
+    )
 
     # -----------------------------------------------------
     # 5. Define the nine shared home sliders.
@@ -1142,8 +1165,8 @@ def get_unified_home(
         },
         "all_platforms": all_platforms,
         "live_tv": {
-            "count": len(live_tv_channels),
-            "channels": live_tv_channels,
+            "count": live_tv_channel_count,
+            "platforms": live_tv_platforms,
         },
         "movies": {
             "count": len(movies),

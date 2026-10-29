@@ -262,6 +262,7 @@ class PlatformLiveChannel(Base):
     stream_url = Column(Text)
     channel_number = Column(Integer)
     display_order = Column(Integer, default=0, nullable=False)
+    category = Column(String, nullable=True)
     is_news_channel = Column(Boolean, default=False)
     is_active = Column(Boolean, default=True, nullable=False)
 

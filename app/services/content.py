@@ -936,6 +936,7 @@ def get_unified_home(
             "id": str(channel.id),
             "name": channel.name,
             "logo_url": channel.logo_url,
+            "media_link": channel.stream_url,
             "category": channel.category if channel.category else None,
             "is_available": channel_is_available,
             "availability_status": (

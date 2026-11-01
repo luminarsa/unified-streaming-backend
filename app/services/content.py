@@ -815,15 +815,24 @@ def get_unified_home(
     entitled_platform_ids = set()
     live_tv_enabled = False
 
+    # Only look up entitlements when a valid subscription and plan exist.
     if subscription is not None and plan is not None:
-        entitled_platform_ids = set(
-            db.scalars(
-                select(PlanEntitlement.platform_id).where(
-                    PlanEntitlement.plan_id == plan.id
-                )
-            ).all()
-        )
 
+        # Load platform IDs included in this plan.
+        entitlement_platform_ids = db.scalars(
+            select(PlanEntitlement.platform_id).where(
+                PlanEntitlement.plan_id == plan.id
+            )
+        ).all()
+
+        # Convert IDs to strings consistently because the access checks
+        # in the rest of this function also use string IDs.
+        entitled_platform_ids = {
+            str(platform_id)
+            for platform_id in entitlement_platform_ids
+        }
+
+        # Check whether live TV is enabled for this plan.
         live_tv_enabled = (
             db.scalar(
                 select(PlanFeature.is_enabled).where(
@@ -849,10 +858,11 @@ def get_unified_home(
     for platform in platforms:
         is_available = (
             plan is not None
-            and platform.id in entitled_platform_ids
+            and str(platform.id) in entitled_platform_ids
         )
 
-        platform_availability[platform.id] = is_available
+        platform_availability[str(platform.id)] = is_available
+
 
         all_platforms.append({
             "id": str(platform.id),
@@ -870,8 +880,9 @@ def get_unified_home(
     entitled_platforms = [
         platform
         for platform in platforms
-        if platform.id in entitled_platform_ids
+        if str(platform.id) in entitled_platform_ids
     ]
+
 
     # -----------------------------------------------------
     # 4. Return live-TV channels grouped by platform.
@@ -896,13 +907,16 @@ def get_unified_home(
     live_tv_by_platform = {}
 
     for channel, channel_platform in channel_rows:
-        channel_is_available = (
-            platform_availability.get(channel_platform.id, False)
-            and channel_platform.supports_live_tv
-            and live_tv_enabled
-        )
 
         platform_id = str(channel_platform.id)
+
+        # A channel is available when its parent platform:
+        # 1. Is active.
+        # 2. Is included in the customer's subscription.
+        channel_is_available = (
+            channel_platform.is_active
+            and platform_availability.get(platform_id, False)
+        )
 
         if platform_id not in live_tv_by_platform:
             live_tv_by_platform[platform_id] = {
@@ -1397,13 +1411,17 @@ def get_platform_home(
             "id": str(platform.id),
             "name": platform.name,
             "slug": platform.slug,
+            "icon": platform.icon if platform.icon else None,
         },
-        "profile": {
-            "id": str(profile.id),
-            "is_kids_profile": profile.is_kids_profile,
+        "user": {
+            "profile_id": str(profile.id),
+            "name": profile.name,
+            "avatar_url": profile.avatar_key,
+            "account_type": (
+                "Kids" if profile.is_kids_profile else "Adult"
+            ),
         },
         "region": region_code,
         "language": language,
         "sliders": home_sliders,
-        "attribution": "Content metadata provided by TMDB.",
     }

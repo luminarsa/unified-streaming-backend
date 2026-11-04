@@ -81,7 +81,9 @@ class PlatformProviderCreate(BaseModel):
 
 class PlatformCompanyCreate(BaseModel):
     platform_id: UUID
+    platform_name: str
     tmdb_company_id: int = Field(gt=0)
+    company_name: str
     relation_type: str = Field(default="produced_by", max_length=40)
     include_in_discovery: bool = True
     confidence: str = Field(default="verified", max_length=20)
@@ -93,7 +95,9 @@ class PlatformCompanyCreate(BaseModel):
 
 class PlatformNetworkCreate(BaseModel):
     platform_id: UUID
+    platform_name: str
     tmdb_network_id: int = Field(gt=0)
+    network_name: str
     include_in_discovery: bool = True
 
 

@@ -124,8 +124,10 @@ class PlatformCompany(Base):
         ForeignKey("streaming_platforms.id", ondelete="CASCADE"),
         nullable=False,
     )
+    platform_name = Column(String, nullable=False)
 
     tmdb_company_id = Column(Integer, nullable=False)
+    company_name = Column(String, nullable=False)
     relation_type = Column(String(40), default="produced_by", nullable=False)
     include_in_discovery = Column(Boolean, default=True, nullable=False)
     confidence = Column(String(20), default="verified", nullable=False)
@@ -154,8 +156,10 @@ class PlatformNetwork(Base):
         ForeignKey("streaming_platforms.id", ondelete="CASCADE"),
         nullable=False,
     )
+    platform_name = Column(String)
 
     tmdb_network_id = Column(Integer, nullable=False)
+    network_name = Column(String, nullable=False)
     include_in_discovery = Column(Boolean, default=True, nullable=False)
 
     __table_args__ = (

@@ -90,6 +90,7 @@ class PlatformProvider(Base):
         ForeignKey("streaming_platforms.id", ondelete="CASCADE"),
         nullable=False,
     )
+    platform_name = Column(String, nullable=False)
 
     # Example: TMDB watch-provider ID
     provider_kind = Column(String(20), nullable=False)

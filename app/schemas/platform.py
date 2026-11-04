@@ -67,6 +67,7 @@ class PlatformProfileUpdate(BaseModel):
 
 class PlatformProviderCreate(BaseModel):
     platform_id: UUID
+    platform_name: str
     provider_kind: str = Field(min_length=1, max_length=20)
     external_id: int = Field(gt=0)
     region_code: str | None = Field(default=None, min_length=2, max_length=2)

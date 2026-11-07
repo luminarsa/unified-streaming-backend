@@ -57,10 +57,6 @@ class WatchList(Base):
         server_default=func.now(),
         nullable=False,
     )
-
-    profile = relationship("Profile", back_populates="watchlist_items")
-    platform = relationship("StreamingPlatform")
-
     __table_args__ = (
         UniqueConstraint(
             "profile_id",

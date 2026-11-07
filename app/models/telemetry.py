@@ -11,11 +11,73 @@ from sqlalchemy import (
     Numeric,
     String,
     UniqueConstraint,
+    Text,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
-
+from sqlalchemy.orm import relationship
 from app.db.base import Base
+
+class WatchList(Base):
+    __tablename__ = "watch_list"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    profile_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    platform_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("streaming_platforms.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    tmdb_id = Column(Integer, nullable=False)
+    media_type = Column(String(10), nullable=False)
+
+    title = Column(String(255), nullable=False)
+    overview = Column(Text)
+    poster_path = Column(String(255))
+    backdrop_path = Column(String(255))
+    release_date = Column(String(30))
+
+    genre_ids = Column(JSONB, default=list, nullable=False)
+    original_language = Column(String(10))
+    vote_average = Column(Numeric(4, 2))
+
+    tmdb_data = Column(JSONB, default=dict, nullable=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    profile = relationship("Profile", back_populates="watchlist_items")
+    platform = relationship("StreamingPlatform")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id",
+            "platform_id",
+            "tmdb_id",
+            "media_type",
+            name="uq_watchlist_profile_platform_content",
+        ),
+        CheckConstraint(
+            "tmdb_id > 0",
+            name="check_watchlist_tmdb_id_positive",
+        ),
+        CheckConstraint(
+            "media_type IN ('movie', 'tv')",
+            name="check_watchlist_media_type",
+        ),
+    )
 
 
 class ViewingSession(Base):

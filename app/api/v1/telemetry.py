@@ -9,18 +9,29 @@ from app.db.session import get_db
 from app.models.identity import Profile
 from app.models.telemetry import WatchProgress
 from app.schemas.telemetry import (
+    WatchListCreate,
+    WatchListItemResponse,
+    WatchListPlatformGroup,
+    WatchListCheckResponse,
+    WatchListDeleteResponse,
     ViewingSessionCreate,
     ViewingSessionResponse,
     ViewingEventCreate,
     WatchProgressResponse,
 )
 from app.services.telemetry import (
+    add_to_watchlist,
+    get_all_watchlists,
+    get_platform_watchlist,
+    check_watchlist_item,
+    delete_watchlist_item,
     create_or_get_session,
     record_viewing_event,
     get_profile_progress,
     get_title_progress,
 )
 
+from app.api.v1.dependencies import get_active_profile
 # IMPORTANT:
 # Replace this import with the module containing your existing function.
 from app.utils.auth import decode_access_token
@@ -28,6 +39,109 @@ from app.utils.auth import decode_access_token
 
 router = APIRouter(prefix="/telemetry", tags=["Telemetry"])
 bearer_scheme = HTTPBearer()
+
+
+@router.post(
+    "",
+    response_model=WatchListItemResponse,
+    status_code=201,
+)
+async def create_watchlist_item(
+    data: WatchListCreate,
+    profile: Profile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
+):
+    """Add a movie or TV show to the selected platform watchlist."""
+
+    return await add_to_watchlist(
+        db=db,
+        profile_id=profile.id,
+        data=data,
+    )
+
+
+@router.get(
+    "",
+    response_model=list[WatchListPlatformGroup],
+)
+def list_all_watchlists(
+    profile: Profile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
+):
+    """Get all watchlists for the active profile, grouped by platform."""
+
+    return get_all_watchlists(
+        db=db,
+        profile_id=profile.id,
+    )
+
+
+@router.get(
+    "/check",
+    response_model=WatchListCheckResponse,
+)
+def check_if_saved(
+    platform_id: UUID,
+    tmdb_id: int = Query(gt=0),
+    media_type: str = Query(pattern="^(movie|tv)$"),
+    profile: Profile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
+):
+    """Check whether a title exists in the selected platform watchlist."""
+
+    item = check_watchlist_item(
+        db=db,
+        profile_id=profile.id,
+        platform_id=platform_id,
+        tmdb_id=tmdb_id,
+        media_type=media_type,
+    )
+
+    return {
+        "saved": item is not None,
+        "item_id": item.id if item else None,
+    }
+
+
+@router.get(
+    "/{platform_id}",
+    response_model=list[WatchListItemResponse],
+)
+def list_platform_watchlist(
+    platform_id: UUID,
+    profile: Profile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
+):
+    """Get the active profile's watchlist for one platform."""
+
+    return get_platform_watchlist(
+        db=db,
+        profile_id=profile.id,
+        platform_id=platform_id,
+    )
+
+
+@router.delete(
+    "/{item_id}",
+    response_model=WatchListDeleteResponse,
+)
+def remove_watchlist_item(
+    item_id: UUID,
+    profile: Profile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
+):
+    """Remove an item from the active profile's watchlist."""
+
+    delete_watchlist_item(
+        db=db,
+        profile_id=profile.id,
+        item_id=item_id,
+    )
+
+    return {
+        "message": "Watchlist item removed successfully.",
+        "item_id": item_id,
+    }
 
 
 def get_active_profile(

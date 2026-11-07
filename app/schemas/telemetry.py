@@ -2,8 +2,7 @@
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
-
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, ConfigDict, Field
 
 
 MediaType = Literal["movie", "tv"]
@@ -16,6 +15,49 @@ EventType = Literal[
     "ended",
 ]
 
+class WatchListCreate(BaseModel):
+    platform_id: UUID
+    tmdb_id: int = Field(gt=0)
+    media_type: MediaType
+
+
+class WatchListItemResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    profile_id: UUID
+    platform_id: UUID
+    tmdb_id: int
+    media_type: MediaType
+
+    title: str
+    overview: str | None = None
+    poster_path: str | None = None
+    backdrop_path: str | None = None
+    release_date: str | None = None
+    genre_ids: list[int] = Field(default_factory=list)
+    original_language: str | None = None
+    vote_average: Decimal | None = None
+
+    tmdb_data: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class WatchListPlatformGroup(BaseModel):
+    platform_id: UUID
+    platform_name: str
+    platform_slug: str
+    items: list[WatchListItemResponse] = Field(default_factory=list)
+
+
+class WatchListCheckResponse(BaseModel):
+    saved: bool
+    item_id: UUID | None = None
+
+
+class WatchListDeleteResponse(BaseModel):
+    message: str
+    item_id: UUID
 
 class ViewingSessionCreate(BaseModel):
     client_session_key: UUID

@@ -2,21 +2,262 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
+from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from app.models.platform_config import StreamingPlatform
+from app.models.identity import Profile
+from app.services.tmdb import TMDBClient
+
 from app.models.telemetry import (
+    WatchList,
     ViewingSession,
     ViewingEvent,
     WatchProgress,
 )
 from app.schemas.telemetry import (
+    WatchListCreate,
     ViewingSessionCreate,
     ViewingEventCreate,
 )
+
+async def add_to_watchlist(
+    db: Session,
+    profile_id: UUID,
+    data: WatchListCreate,
+) -> WatchList:
+    """Fetch content from TMDB and add it to a profile's platform watchlist."""
+
+    # 1. Check that the platform exists and is active.
+    platform = db.get(StreamingPlatform, data.platform_id)
+
+    if platform is None or not platform.is_active:
+        raise HTTPException(
+            status_code=404,
+            detail="Streaming platform not found or inactive.",
+        )
+
+    # 2. Check that the platform supports the requested media type.
+    if data.media_type == "movie" and not platform.supports_movies:
+        raise HTTPException(
+            status_code=400,
+            detail="This platform does not support movies.",
+        )
+
+    if data.media_type == "tv" and not platform.supports_tv_shows:
+        raise HTTPException(
+            status_code=400,
+            detail="This platform does not support TV shows.",
+        )
+
+    # 3. Check whether this title is already saved.
+    existing_item = (
+        db.query(WatchList)
+        .filter(
+            WatchList.profile_id == profile_id,
+            WatchList.platform_id == data.platform_id,
+            WatchList.tmdb_id == data.tmdb_id,
+            WatchList.media_type == data.media_type,
+        )
+        .first()
+    )
+
+    if existing_item:
+        raise HTTPException(
+            status_code=409,
+            detail="This title is already in your watchlist.",
+        )
+
+    # 4. Fetch the official content details from TMDB.
+    tmdb = TMDBClient()
+
+    try:
+        tmdb_data = await tmdb.get(
+            f"/{data.media_type}/{data.tmdb_id}"
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            raise HTTPException(
+                status_code=404,
+                detail="This title could not be found on TMDB.",
+            )
+
+        raise HTTPException(
+            status_code=502,
+            detail="TMDB could not provide the content details.",
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to retrieve content details from TMDB.",
+        )
+
+    # 5. Extract consistent fields from the TMDB response.
+    title = tmdb_data.get("title") or tmdb_data.get("name")
+
+    if not title:
+        raise HTTPException(
+            status_code=502,
+            detail="TMDB returned content without a title.",
+        )
+
+    genres = tmdb_data.get("genres") or []
+    genre_ids = [
+        genre["id"]
+        for genre in genres
+        if isinstance(genre, dict) and genre.get("id") is not None
+    ]
+
+    release_date = (
+        tmdb_data.get("release_date")
+        or tmdb_data.get("first_air_date")
+    )
+
+    # 6. Create the watchlist record.
+    watchlist_item = WatchList(
+        profile_id=profile_id,
+        platform_id=data.platform_id,
+        tmdb_id=data.tmdb_id,
+        media_type=data.media_type,
+        title=title,
+        overview=tmdb_data.get("overview"),
+        poster_path=tmdb_data.get("poster_path"),
+        backdrop_path=tmdb_data.get("backdrop_path"),
+        release_date=release_date,
+        genre_ids=genre_ids,
+        original_language=tmdb_data.get("original_language"),
+        vote_average=tmdb_data.get("vote_average"),
+        tmdb_data=tmdb_data,
+    )
+
+    db.add(watchlist_item)
+
+    try:
+        db.commit()
+        db.refresh(watchlist_item)
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Could not add this title. It may already be in your watchlist.",
+        )
+
+    return watchlist_item
+
+
+def get_all_watchlists(
+    db: Session,
+    profile_id: UUID,
+) -> list[dict[str, Any]]:
+    """Return all watchlist entries grouped by streaming platform."""
+
+    results = (
+        db.query(WatchList, StreamingPlatform)
+        .join(
+            StreamingPlatform,
+            WatchList.platform_id == StreamingPlatform.id,
+        )
+        .filter(WatchList.profile_id == profile_id)
+        .order_by(
+            StreamingPlatform.display_order,
+            WatchList.created_at.desc(),
+        )
+        .all()
+    )
+
+    grouped: dict[UUID, dict[str, Any]] = {}
+
+    for item, platform in results:
+        if platform.id not in grouped:
+            grouped[platform.id] = {
+                "platform_id": platform.id,
+                "platform_name": platform.name,
+                "platform_slug": platform.slug,
+                "items": [],
+            }
+
+        grouped[platform.id]["items"].append(item)
+
+    return list(grouped.values())
+
+
+def get_platform_watchlist(
+    db: Session,
+    profile_id: UUID,
+    platform_id: UUID,
+) -> list[WatchList]:
+    """Return one profile's watchlist for a specific platform."""
+
+    platform = db.get(StreamingPlatform, platform_id)
+
+    if platform is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Streaming platform not found.",
+        )
+
+    return (
+        db.query(WatchList)
+        .filter(
+            WatchList.profile_id == profile_id,
+            WatchList.platform_id == platform_id,
+        )
+        .order_by(WatchList.created_at.desc())
+        .all()
+    )
+
+
+def check_watchlist_item(
+    db: Session,
+    profile_id: UUID,
+    platform_id: UUID,
+    tmdb_id: int,
+    media_type: str,
+) -> WatchList | None:
+    """Check whether a title is saved in a specific platform watchlist."""
+
+    return (
+        db.query(WatchList)
+        .filter(
+            WatchList.profile_id == profile_id,
+            WatchList.platform_id == platform_id,
+            WatchList.tmdb_id == tmdb_id,
+            WatchList.media_type == media_type,
+        )
+        .first()
+    )
+
+
+def delete_watchlist_item(
+    db: Session,
+    profile_id: UUID,
+    item_id: UUID,
+) -> bool:
+    """Delete a watchlist item belonging to the active profile."""
+
+    item = (
+        db.query(WatchList)
+        .filter(
+            WatchList.id == item_id,
+            WatchList.profile_id == profile_id,
+        )
+        .first()
+    )
+
+    if item is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Watchlist item not found.",
+        )
+
+    db.delete(item)
+    db.commit()
+
+    return True
 
 
 def create_or_get_session(

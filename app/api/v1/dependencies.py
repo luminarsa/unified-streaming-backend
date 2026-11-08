@@ -3,7 +3,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models.identity import AuthSession, Profile
+from app.models.identity import Profile
 from app.utils.auth import decode_access_token
 
 
@@ -15,8 +15,8 @@ def get_current_session(
         bearer_scheme
     ),
     db: Session = Depends(get_db),
-) -> AuthSession:
-    """Return the authenticated session for a protected API request."""
+) -> dict:
+    """Return the validated JWT data for a protected API request."""
 
     if credentials is None:
         raise HTTPException(
@@ -32,19 +32,21 @@ def get_current_session(
 
 
 def get_current_account_id(
-    current_session: AuthSession = Depends(get_current_session),
+    current_session: dict = Depends(get_current_session),
 ):
-    """Return the account ID associated with the valid session."""
+    """Return the account ID associated with the valid token."""
 
-    return current_session.account_id
+    return current_session["account_id"]
+
 
 def get_active_profile(
-    current_session: AuthSession = Depends(get_current_session),
+    current_session: dict = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> Profile:
-    """Return the profile selected in the authenticated session."""
+    """Return the profile selected in the authenticated JWT."""
 
-    profile_id = current_session.active_profile_id
+    profile_id = current_session.get("profile_id")
+    account_id = current_session["account_id"]
 
     if not profile_id:
         raise HTTPException(
@@ -54,7 +56,7 @@ def get_active_profile(
 
     profile = db.get(Profile, profile_id)
 
-    if profile is None or str(profile.account_id) != str(current_session.account_id):
+    if profile is None or str(profile.account_id) != str(account_id):
         raise HTTPException(
             status_code=403,
             detail="The active profile does not belong to this account.",

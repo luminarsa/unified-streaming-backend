@@ -2,81 +2,134 @@ from typing import Any
 import httpx
 from app.core.config import settings
 
+
+from typing import Any
+
+import httpx
+
+from app.core.config import settings
+
+
 class TMDBError(RuntimeError):
     pass
 
+
 class TMDBClient:
+
     def __init__(self):
         self.base_url = settings.tmdb_api_base.rstrip("/")
 
-async def get(
-    self,
-    path: str,
-    params: dict[str, Any] | None = None
-) -> dict[str, Any]:
+    async def get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
 
-    if not settings.tmdb_api_read_access_token:
-        raise TMDBError("TMDB_API_READ_ACCESS_TOKEN is not configured")
-
-    headers = {
-        "Authorization": f"Bearer {settings.tmdb_api_read_access_token}",
-        "accept": "application/json"
-    }
-
-    query = {
-        "language": settings.tmdb_language,
-        **(params or {})
-    }
-
-    print("\n========== TMDB REQUEST ==========")
-    print("PATH:", path)
-    print("PARAMETERS:", query)
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=settings.tmdb_timeout_seconds
-        ) as client:
-
-            response = await client.get(
-                f"{self.base_url}{path}",
-                params=query,
-                headers=headers
+        if not settings.tmdb_api_read_access_token:
+            raise TMDBError(
+                "TMDB_API_READ_ACCESS_TOKEN is not configured"
             )
 
-            print("REQUEST URL:", response.request.url)
+        headers = {
+            "Authorization": f"Bearer {settings.tmdb_api_read_access_token}",
+            "accept": "application/json"
+        }
 
-            response.raise_for_status()
+        query = {
+            "language": settings.tmdb_language,
+            **(params or {})
+        }
 
-            data = response.json()
+        print("\n========== TMDB REQUEST ==========")
+        print("PATH:", path)
+        print("PARAMETERS:", query)
 
-            print("TOTAL RESULTS:", data.get("total_results"))
-            print("TOTAL PAGES:", data.get("total_pages"))
+        try:
+            async with httpx.AsyncClient(
+                timeout=settings.tmdb_timeout_seconds
+            ) as client:
 
-            for item in data.get("results", [])[:5]:
-                print(
-                    "RESULT:",
-                    item.get("id"),
-                    item.get("title") or item.get("name"),
-                    "POPULARITY:",
-                    item.get("popularity"),
-                    "GENRES:",
-                    item.get("genre_ids")
+                response = await client.get(
+                    f"{self.base_url}{path}",
+                    params=query,
+                    headers=headers
                 )
 
-            print("========== END TMDB REQUEST ==========\n")
+                print("REQUEST URL:", response.request.url)
 
-            return data
+                response.raise_for_status()
 
-    except httpx.HTTPError as exc:
-        print("TMDB HTTP ERROR:", str(exc))
-        raise TMDBError("TMDB request failed") from exc
-    
-    async def trending(self, media_type: str, window: str = "week", page: int = 1):
-        if media_type not in {"movie", "tv", "all"} or window not in {"day", "week"}:
-            raise ValueError("Invalid trending request")
-        return await self.get(f"/trending/{media_type}/{window}", {"page": page})
+                data = response.json()
 
-    async def discover(self, media_type: str, params: dict[str, Any]):
+                print("TOTAL RESULTS:", data.get("total_results"))
+                print("TOTAL PAGES:", data.get("total_pages"))
+
+                for item in data.get("results", [])[:5]:
+                    print(
+                        "RESULT:",
+                        item.get("id"),
+                        item.get("title") or item.get("name"),
+                        "POPULARITY:",
+                        item.get("popularity"),
+                        "GENRES:",
+                        item.get("genre_ids")
+                    )
+
+                print("========== END TMDB REQUEST ==========\n")
+
+                return data
+
+        except httpx.HTTPError as exc:
+            print("TMDB HTTP ERROR:", str(exc))
+            raise TMDBError("TMDB request failed") from exc
+
+    async def trending(
+        self,
+        media_type: str,
+        window: str = "week",
+        page: int = 1
+    ):
+
+        if media_type not in {"movie", "tv", "all"}:
+            raise ValueError("Invalid media type")
+
+        if window not in {"day", "week"}:
+            raise ValueError("Invalid trending window")
+
+        return await self.get(
+            f"/trending/{media_type}/{window}",
+            {"page": page}
+        )
+
+    async def discover(
+        self,
+        media_type: str,
+        params: dict[str, Any]
+    ):
+
         if media_type not in {"movie", "tv"}:
             raise ValueError("media_type must be movie or tv")
-        return await self.get(f"/discover/{media_type}", params)
+
+        return await self.get(
+            f"/discover/{media_type}",
+            params
+        )
+
+    async def movie_details(self, tmdb_id: int):
+        return await self.get(f"/movie/{tmdb_id}")
+
+    async def tv_details(self, tmdb_id: int):
+        return await self.get(f"/tv/{tmdb_id}")
+
+    async def content_details(
+        self,
+        media_type: str,
+        tmdb_id: int
+    ):
+        if media_type == "movie":
+            return await self.movie_details(tmdb_id)
+
+        if media_type == "tv":
+            return await self.tv_details(tmdb_id)
+
+        raise ValueError("media_type must be movie or tv")

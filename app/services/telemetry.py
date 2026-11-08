@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
 from typing import Any
-
+import httpx
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.models.platform_config import StreamingPlatform
 from app.models.identity import Profile
-from app.services.tmdb import TMDBClient
+from app.services.tmdb import TMDBClient, TMDBError
 
 from app.models.telemetry import (
     WatchList,
@@ -24,6 +24,10 @@ from app.schemas.telemetry import (
     ViewingSessionCreate,
     ViewingEventCreate,
 )
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 async def add_to_watchlist(
     db: Session,
@@ -72,6 +76,7 @@ async def add_to_watchlist(
             detail="This title is already in your watchlist.",
         )
 
+
     # 4. Fetch the official content details from TMDB.
     tmdb = TMDBClient()
 
@@ -79,7 +84,15 @@ async def add_to_watchlist(
         tmdb_data = await tmdb.get(
             f"/{data.media_type}/{data.tmdb_id}"
         )
+
     except httpx.HTTPStatusError as exc:
+        logger.exception(
+            "TMDB returned HTTP %s while retrieving %s ID %s",
+            exc.response.status_code,
+            data.media_type,
+            data.tmdb_id,
+        )
+
         if exc.response.status_code == 404:
             raise HTTPException(
                 status_code=404,
@@ -90,10 +103,35 @@ async def add_to_watchlist(
             status_code=502,
             detail="TMDB could not provide the content details.",
         )
-    except Exception:
+
+    except TMDBError as exc:
+        logger.exception("TMDB configuration error: %s", str(exc))
+
+        raise HTTPException(
+            status_code=503,
+            detail="TMDB is not correctly configured.",
+        )
+
+    except httpx.RequestError:
+        logger.exception(
+            "Network error while connecting to TMDB."
+        )
+
         raise HTTPException(
             status_code=502,
-            detail="Unable to retrieve content details from TMDB.",
+            detail="Could not connect to TMDB. Please try again.",
+        )
+
+    except Exception:
+        logger.exception(
+            "Unexpected error retrieving TMDB content. Media type: %s, ID: %s",
+            data.media_type,
+            data.tmdb_id,
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail="An unexpected error occurred while retrieving content from TMDB.",
         )
 
     # 5. Extract consistent fields from the TMDB response.

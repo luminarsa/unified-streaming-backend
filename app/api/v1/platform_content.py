@@ -4,6 +4,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.models.identity import Profile
+from app.schemas.platform_search import PlatformSearchEntitlements
+from app.services.platform_search import (
+    get_platform_search_entitlements,
+)
 from app.services.content import get_unified_home, get_platform_home
 from app.utils.auth import decode_access_token
 
@@ -66,6 +70,79 @@ def get_unified_account_home(
         account_id=account_uuid,
         profile=profile,
     )
+
+
+# ---------------------------------------------------------
+# PLATFORM SEARCH ENTITLEMENTS
+# ---------------------------------------------------------
+
+@router.get(
+    "/{platform_id}/search-entitlements",
+    response_model=PlatformSearchEntitlements,
+)
+def get_platform_search_entitlements_endpoint(
+    platform_id: UUID,
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+):
+    # ---------------------------------------------------------
+    # 1. AUTHENTICATE ACCOUNT
+    # ---------------------------------------------------------
+
+    token_data = decode_access_token(
+        db=db,
+        raw_token=credentials.credentials,
+    )
+
+    try:
+        account_id = UUID(str(token_data["account_id"]))
+
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid account identity in access token.",
+        )
+
+    # ---------------------------------------------------------
+    # 2. REQUIRE ACTIVE PROFILE
+    # ---------------------------------------------------------
+
+    active_profile_id = token_data.get("profile_id")
+
+    if not active_profile_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Select a profile before accessing platform search.",
+        )
+
+    try:
+        profile_id = UUID(str(active_profile_id))
+
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid profile identity in access token.",
+        )
+
+    profile = db.get(Profile, profile_id)
+
+    if profile is None or profile.account_id != account_id:
+        raise HTTPException(
+            status_code=403,
+            detail="The active profile does not belong to this account.",
+        )
+
+    # ---------------------------------------------------------
+    # 3. GET PLATFORM SEARCH ENTITLEMENTS
+    # ---------------------------------------------------------
+
+    return get_platform_search_entitlements(
+        db=db,
+        account_id=account_id,
+        platform_id=platform_id,
+        profile=profile,
+    )
+
 
 @router.get("/{platform_id}/home")
 def get_platform_home_page(

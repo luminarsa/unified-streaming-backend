@@ -28,6 +28,8 @@ class Plan(Base):
     # Store prices in cents: R100.00 = 10000
     price_minor = Column(Numeric, nullable=False)
     currency = Column(String(3), default="ZAR", nullable=False)
+    paypal_price = Column(Numeric(10, 2))
+    paypal_currency = Column(String(3))
     billing_interval = Column(String(20), default="Monthly", nullable=False)
     max_simultaneous_streams = Column(Integer, nullable=False, default=1)
     is_active = Column(Boolean, default=True, nullable=False)
@@ -81,7 +83,7 @@ class Subscription(Base):
         nullable=False,
     )
 
-    status = Column(String(30), default="pending", nullable=False)
+    status = Column(String(30), default="active", nullable=False)
 
     provider = Column(String(50))
     provider_customer_id = Column(String(200))

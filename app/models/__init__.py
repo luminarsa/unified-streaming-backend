@@ -24,3 +24,6 @@ from app.models.telemetry import (
     ViewingEvent,
     WatchProgress,
 )
+from app.models.payment_method import PaymentMethod
+from app.models.payment_transaction import PaymentTransaction
+from app.models.paypal_webhook_event import PayPalWebhookEvent

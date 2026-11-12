@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.models.commercial import Plan, Subscription
 from app.models.identity import Profile
 from app.models.payment_transaction import PaymentTransaction
-
+from app.services.payment_finalization import finalize_successful_payment
 from app.services import paypal
 
 
@@ -498,27 +498,14 @@ async def capture_checkout(
         )
 
     # -----------------------------------------------------
-    # Activate subscription and complete transaction
+    # Finalise verified successful payment
     # -----------------------------------------------------
 
-    now = datetime.now(timezone.utc)
-
-    transaction.provider_capture_id = capture_id
-    transaction.provider_transaction_id = capture_id
-    transaction.status = "completed"
-    transaction.completed_at = now
-    transaction.failure_message = None
-
-    subscription.status = "active"
-    subscription.current_period_start = now
-
-    # Billing period end will be managed by recurring billing.
-    # We will calculate it when implementing renewal scheduling.
-
-    db.commit()
-
-    db.refresh(subscription)
-    db.refresh(transaction)
+    finalization = finalize_successful_payment(
+        db=db,
+        transaction_id=transaction.id,
+        capture_id=capture_id,
+    )
 
     return {
         "order_id": order_id,
@@ -526,7 +513,9 @@ async def capture_checkout(
         "transaction_id": str(transaction.id),
         "subscription_id": str(subscription.id),
         "payment_status": "COMPLETED",
-        "subscription_status": subscription.status,
+        "subscription_status": finalization["subscription_status"],
+        "current_period_start": finalization["current_period_start"],
+        "current_period_end": finalization["current_period_end"],
         "currency": expected_currency,
         "amount": _format_amount(expected_amount),
     }

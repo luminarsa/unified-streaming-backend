@@ -171,3 +171,6 @@ class PlatformLiveChannelCreate(BaseModel):
     is_news_channel: bool = False
     is_active: bool = True
     metadata_json: dict[str, Any] = Field(default_factory=dict)
+
+class AvatarCreate(BaseModel):
+    url: str

@@ -12,6 +12,7 @@ class PrimaryProfileCreate(BaseModel):
 class RegisterRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=10, max_length=128)
+    refferal_code: str = Field(min_length=3, max_length=15)
     primary_profile: PrimaryProfileCreate
 
 class LoginRequest(BaseModel):

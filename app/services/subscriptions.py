@@ -63,10 +63,13 @@ def _plan_data(db: Session, plan: Plan) -> dict:
 
     return {
         "id": plan.id,
+        "category": plan.category,
         "code": plan.code,
         "name": plan.name,
-        "price_minor": plan.price_minor,
+        "price_minor": (plan.price_minor / 1000),
         "currency": plan.currency,
+        "paypal_price": plan.paypal_price,
+        "paypal_curreny": plan.paypal_currency,
         "billing_interval": plan.billing_interval,
         "is_active": plan.is_active,
         "max_simultaneous_streams": plan.max_simultaneous_streams,

@@ -80,6 +80,17 @@ class Profile(Base):
 
     account = relationship("Account", back_populates="profiles")
 
+class Avatar(Base):
+    __tablename__ = "avatars"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    url = Column(String)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    
 class AuthSession(Base):
     """Stores one signed-in session for an account."""
 

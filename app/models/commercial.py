@@ -22,6 +22,7 @@ class Plan(Base):
     __tablename__ = "plans"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    category = Column(String) #Students, House Hold, Commercial & Short Term Rentals
     code = Column(String(40), nullable=False, unique=True)
     name = Column(String(80), nullable=False)
 

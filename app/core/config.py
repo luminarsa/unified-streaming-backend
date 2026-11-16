@@ -18,9 +18,9 @@ class Settings(BaseSettings):
 
     # PayPal
     paypal_environment: str = "sandbox"
-    paypal_client_id: str = "BAAIwFxEtAPlWx2Kss8DJ4f00Wx6bkOi-ChVerUVVTufLFCR2P2XqKT0b5R6wyyd4fzQgcU_kShChJvVOU"
-    paypal_client_secret: str = "EF9Fq0TZ6furfQTUS9xxfK-n5pSu8dNXLpoAGF6Epm7fMIsFxYLQ-Z0LTsinY5WHATHkn9pQ2n0Iw8a_"
-    paypal_webhook_id: str = "7CB81425CA0555210"
+    paypal_client_id: str = "BAAR-hvNWq567Is6LIOKZfL782WRWdYaMmCLosNnXtS6ChJuBuVr8GtogruZrtyR8S8mmhIJICLV1FDwJQ"
+    paypal_client_secret: str = "EPeifxsZICwJVrREEOjcVai2yn_Z8FTg7nlRL2OsHK9wAbll9vYdnPrvoUtTGsFW-K10U94heRKnfC5P"
+    paypal_webhook_id: str = "6JA85010LK1578833"
     paypal_api_timeout_seconds: float = 30.0
 
     # AES-256 encryption key for payment tokens.

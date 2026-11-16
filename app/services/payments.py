@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session
 from app.models.commercial import Plan, Subscription
 from app.models.identity import Profile
 from app.models.payment_transaction import PaymentTransaction
-from app.services.payment_finalization import finalize_successful_payment
 from app.services import paypal
 
 
@@ -264,6 +263,27 @@ async def capture_checkout(
             "subscription_status": subscription.status,
         }
 
+    # If PayPal capture has already been recorded,
+    # wait for the webhook to finalise the payment.
+    if transaction.status == "processing" and transaction.provider_capture_id:
+        subscription = (
+            db.query(Subscription)
+            .filter(
+                Subscription.id == transaction.subscription_id,
+                Subscription.account_id == profile.account_id,
+            )
+            .first()
+        )
+
+        return {
+            "order_id": order_id,
+            "capture_id": transaction.provider_capture_id,
+            "transaction_id": str(transaction.id),
+            "subscription_id": str(transaction.subscription_id),
+            "payment_status": "PROCESSING",
+            "subscription_status": subscription.status if subscription else "pending",
+        }
+
     if transaction.status != "pending":
         raise HTTPException(
             status_code=409,
@@ -498,24 +518,29 @@ async def capture_checkout(
         )
 
     # -----------------------------------------------------
-    # Finalise verified successful payment
+    # Record successful PayPal capture
     # -----------------------------------------------------
 
-    finalization = finalize_successful_payment(
-        db=db,
-        transaction_id=transaction.id,
-        capture_id=capture_id,
-    )
+    # Important:
+    # Do not activate the subscription here.
+    # The verified PayPal webhook will do that.
+
+    transaction.provider_capture_id = capture_id
+    transaction.provider_transaction_id = capture_id
+    transaction.status = "processing"
+    transaction.failure_message = None
+
+    db.commit()
+    db.refresh(transaction)
 
     return {
         "order_id": order_id,
         "capture_id": capture_id,
         "transaction_id": str(transaction.id),
         "subscription_id": str(subscription.id),
-        "payment_status": "COMPLETED",
-        "subscription_status": finalization["subscription_status"],
-        "current_period_start": finalization["current_period_start"],
-        "current_period_end": finalization["current_period_end"],
+        "payment_status": "PROCESSING",
+        "subscription_status": "pending",
         "currency": expected_currency,
         "amount": _format_amount(expected_amount),
+        "message": "Payment captured. Awaiting PayPal webhook confirmation.",
     }

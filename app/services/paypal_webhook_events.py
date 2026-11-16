@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 from app.models.paypal_webhook_event import PayPalWebhookEvent
 from app.models.commercial import Subscription
 from app.models.payment_transaction import PaymentTransaction
+from app.services.payment_finalization import finalize_successful_payment
 from app.services import paypal
 
 def store_verified_webhook_event(
@@ -282,6 +283,45 @@ async def process_capture_completed_event(
         )
 
     # -----------------------------------------------------
+    # 7A. Verify the authoritative capture amount
+    # -----------------------------------------------------
+
+    authoritative_amount = matching_capture.get("amount") or {}
+
+    try:
+        authoritative_capture_amount = Decimal(
+            str(authoritative_amount.get("value"))
+        )
+    except (InvalidOperation, ValueError, TypeError):
+        raise ValueError(
+            "The retrieved PayPal capture contains an invalid amount."
+        )
+
+    authoritative_capture_currency = authoritative_amount.get(
+        "currency_code"
+    )
+
+    if (
+        authoritative_capture_amount != transaction.amount
+        or authoritative_capture_currency != transaction.currency
+    ):
+        raise ValueError(
+            "The retrieved PayPal capture amount or currency "
+            "does not match the local transaction."
+        )
+
+    # Also make sure the webhook and authoritative capture agree.
+    if (
+        actual_amount != authoritative_capture_amount
+        or actual_currency != authoritative_capture_currency
+    ):
+        raise ValueError(
+            "The PayPal webhook capture details do not match "
+            "the retrieved PayPal capture."
+        )
+
+
+    # -----------------------------------------------------
     # 8. Prevent conflicting or duplicate capture records
     # -----------------------------------------------------
 
@@ -303,25 +343,18 @@ async def process_capture_completed_event(
         )
 
     # -----------------------------------------------------
-    # 9. Complete the transaction and activate subscription
+    # 9. Finalise verified successful payment
     # -----------------------------------------------------
 
-    now = datetime.now(timezone.utc)
-
-    transaction.provider_capture_id = capture_id
-    transaction.provider_transaction_id = capture_id
-    transaction.webhook_event_id = provider_event_id
-    transaction.status = "completed"
-    transaction.completed_at = transaction.completed_at or now
-    transaction.failure_message = None
-
-    subscription.status = "active"
-
-    if subscription.current_period_start is None:
-        subscription.current_period_start = now
+    finalization = finalize_successful_payment(
+        db=db,
+        transaction_id=transaction.id,
+        capture_id=capture_id,
+        provider_event_id=provider_event_id,
+    )
 
     event.status = "processed"
-    event.processed_at = now
+    event.processed_at = datetime.now(timezone.utc)
     event.last_error = None
 
     db.commit()
@@ -332,8 +365,10 @@ async def process_capture_completed_event(
         "capture_id": capture_id,
         "transaction_id": str(transaction.id),
         "subscription_id": str(subscription.id),
-        "payment_status": transaction.status,
-        "subscription_status": subscription.status,
+        "payment_status": finalization["payment_status"],
+        "subscription_status": finalization["subscription_status"],
+        "current_period_start": finalization["current_period_start"],
+        "current_period_end": finalization["current_period_end"],
     }
 
 

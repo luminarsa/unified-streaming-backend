@@ -9,7 +9,7 @@ from fastapi import (
 )
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
-
+from app.models.platform_config import StreamingPlatform
 from app.db.session import get_db
 from app.utils.auth import decode_access_token
 from app.services.subscriptions import (
@@ -56,6 +56,26 @@ def get_authenticated_account_id(
 # ---------------------------------------------------------
 # PUBLIC PLAN CATALOG
 # ---------------------------------------------------------
+@router.get("/platforms", status_code=status.HTTP_200_OK)
+def get_lumina_platforms(
+    db: Session = Depends(get_db),
+):
+    platforms = (
+        db.query(StreamingPlatform)
+        .filter(StreamingPlatform.is_active == True)
+        .order_by(StreamingPlatform.created_at.asc())
+        .all()
+    )
+
+    return [
+        {
+            "id": p.id,
+            "name": p.name,
+            "logo": p.logo_url
+        }
+        for p in platforms
+    ]
+
 @router.post("/plans", status_code=status.HTTP_201_CREATED)
 def create_new_plan(
     payload: dict,

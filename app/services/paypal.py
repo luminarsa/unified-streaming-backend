@@ -467,6 +467,16 @@ async def verify_webhook_signature(
             f"Could not verify PayPal webhook: {str(exc)}"
         ) from exc
 
-    return (
-        response.get("verification_status") == "SUCCESS"
-    )
+    verification_status = response.get("verification_status")
+
+    if verification_status != "SUCCESS":
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        logger.warning(
+            "PayPal webhook verification returned: %s",
+            verification_status,
+        )
+
+    return verification_status == "SUCCESS"

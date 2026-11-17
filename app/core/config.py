@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     tmdb_timeout_seconds: float = 40.0
 
     # Redis
-    redis_url: str | None = None
+    redis_url: str = "redis://red-dbub4i0m7kps73bsb63g:6379"
 
     # PayPal
     paypal_environment: str = "sandbox"

@@ -18,10 +18,24 @@ class Settings(BaseSettings):
 
     # PayPal
     paypal_environment: str = "sandbox"
-    paypal_client_id: str = "BAAR-hvNWq567Is6LIOKZfL782WRWdYaMmCLosNnXtS6ChJuBuVr8GtogruZrtyR8S8mmhIJICLV1FDwJQ"
-    paypal_client_secret: str = "EPeifxsZICwJVrREEOjcVai2yn_Z8FTg7nlRL2OsHK9wAbll9vYdnPrvoUtTGsFW-K10U94heRKnfC5P"
-    paypal_webhook_id: str = "6JA85010LK1578833"
+    paypal_client_id: str = "BAAkOCt7bqHguWccAM0613fyP58PaxVMf9pp_nNS-Mlsc2B0gRGDtaal1WR9AVZOogv-1B3fPR4sKtCzM8"
+    paypal_client_secret: str = "EMVwxlAPZzShVbIQeoGomMW0XDzIwGKqez7xXN29XM5HgueSN29jfQvXIihVxqL7u2rP66a-AToA0NeT"
+    paypal_webhook_id: str = ""
     paypal_api_timeout_seconds: float = 30.0
+
+    # PayPal Invoicer Details
+    paypal_invoicer_name: str = "Lumina"
+    paypal_invoicer_email: str = ""
+    paypal_business_name: str = "Lumina"
+    paypal_business_phone: str = ""
+
+    # Business address used on PayPal invoices
+    paypal_business_address_line_1: str = ""
+    paypal_business_address_line_2: str = ""
+    paypal_business_city: str = ""
+    paypal_business_state: str = ""
+    paypal_business_postal_code: str = ""
+    paypal_business_country_code: str = "ZA"
 
     # AES-256 encryption key for payment tokens.
     # Generate this once and keep it in your .env file.

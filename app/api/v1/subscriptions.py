@@ -21,6 +21,14 @@ from app.services.subscriptions import (
     create_plan,
     admin_assign_plan_to_account
 )
+from app.schemas.payment import SubscriptionCheckoutRequest
+from app.services.paypal import PayPalError, inspect_paypal_identity
+from app.services.payment_creation import (
+    create_subscription_payment,
+    PaymentCreationError,
+)
+from app.api.v1.dependencies import get_current_account_id
+from app.services.paypal import get_paypal_diagnostics
 
 
 router = APIRouter(tags=["Subscriptions"])
@@ -52,10 +60,62 @@ def get_authenticated_account_id(
             detail="Invalid account identity in access token.",
         )
 
+@router.get("/paypal/inspect-identity")
+async def inspect_paypal_account(
+    account_id: str = Depends(get_current_account_id),
+):
+    try:
+        return await inspect_paypal_identity()
+
+    except PayPalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+    return {
+        "identity": await inspect_paypal_identity(),
+        "configuration": get_paypal_diagnostics(),
+    }
 
 # ---------------------------------------------------------
-# PUBLIC PLAN CATALOG
+# PAYPAL SUBSCRIPTION CHECKOUT
 # ---------------------------------------------------------
+
+@router.post(
+    "/subscriptions/checkout",
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_subscription_checkout(
+    payload: SubscriptionCheckoutRequest,
+    account_id: str = Depends(get_current_account_id),
+    db: Session = Depends(get_db),
+) -> dict:
+
+    try:
+        authenticated_account_id = UUID(str(account_id))
+        plan_id = UUID(str(payload.plan_id))
+
+        result = await create_subscription_payment(
+            db=db,
+            account_id=authenticated_account_id,
+            plan_id=plan_id,
+            idempotency_key=payload.idempotency_key,
+        )
+
+        return result
+
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A valid account ID or plan ID is required.",
+        )
+
+    except PaymentCreationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
 @router.get("/platforms", status_code=status.HTTP_200_OK)
 def get_lumina_platforms(
     db: Session = Depends(get_db),

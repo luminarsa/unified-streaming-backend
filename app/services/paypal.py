@@ -1,18 +1,40 @@
 
 import base64
-
+import logging
+import hashlib
 import httpx
 
 from app.core.config import settings
 
 
+logger = logging.getLogger(__name__)
+
+
 class PayPalError(RuntimeError):
     pass
 
+def get_paypal_diagnostics():
+    client_id, _ = get_paypal_credentials()
 
-# ---------------------------------------------------------
+    fingerprint = hashlib.sha256(
+        client_id.encode("utf-8")
+    ).hexdigest()[:12]
+
+    return {
+        "environment": settings.paypal_environment,
+        "base_url": get_paypal_base_url(),
+        "client_id_fingerprint": fingerprint,
+    }
+# =========================================================
 # 1. PAYPAL CONFIGURATION
-# ---------------------------------------------------------
+# =========================================================
+
+async def inspect_paypal_identity():
+    return await paypal_request(
+        method="GET",
+        path="/v1/identity/oauth2/userinfo",
+        params={"schema": "paypalv1.1"},
+    )
 
 def get_paypal_base_url() -> str:
     if settings.paypal_environment.lower() == "live":
@@ -21,7 +43,7 @@ def get_paypal_base_url() -> str:
     return "https://api-m.sandbox.paypal.com"
 
 
-def _get_credentials():
+def get_paypal_credentials():
     client_id = settings.paypal_client_id
     client_secret = settings.paypal_client_secret
 
@@ -33,12 +55,12 @@ def _get_credentials():
     return client_id, client_secret
 
 
-# ---------------------------------------------------------
-# 2. GET PAYPAL ACCESS TOKEN
-# ---------------------------------------------------------
+# =========================================================
+# 2. PAYPAL AUTHENTICATION
+# =========================================================
 
 async def get_access_token() -> str:
-    client_id, client_secret = _get_credentials()
+    client_id, client_secret = get_paypal_credentials()
 
     credentials = f"{client_id}:{client_secret}"
 
@@ -60,7 +82,9 @@ async def get_access_token() -> str:
             response = await client.post(
                 url,
                 headers=headers,
-                data={"grant_type": "client_credentials"},
+                data={
+                    "grant_type": "client_credentials",
+                },
             )
 
             response.raise_for_status()
@@ -77,26 +101,32 @@ async def get_access_token() -> str:
             return access_token
 
         except httpx.HTTPStatusError as exc:
+            logger.error(
+                "PayPal authentication failed: HTTP %s",
+                exc.response.status_code,
+            )
+
             raise PayPalError(
-                f"PayPal authentication failed with HTTP "
-                f"{exc.response.status_code}."
+                "PayPal authentication failed."
             ) from exc
 
         except httpx.HTTPError as exc:
             raise PayPalError(
-                "Unable to authenticate with PayPal."
+                "Unable to connect to PayPal authentication."
             ) from exc
 
 
-# ---------------------------------------------------------
+# =========================================================
 # 3. COMMON PAYPAL API REQUEST
-# ---------------------------------------------------------
+# =========================================================
 
 async def paypal_request(
     method: str,
     path: str,
     payload: dict | None = None,
+    params: dict | None = None,
     request_id: str | None = None,
+    prefer: str | None = None,
 ):
     access_token = await get_access_token()
 
@@ -108,10 +138,14 @@ async def paypal_request(
         "Accept": "application/json",
     }
 
-    # PayPal idempotency support.
-    # Reuse the same request ID when retrying the same operation.
+    # PayPal idempotency key.
+    # Reusing the same key for a retry helps prevent
+    # duplicate invoice creation.
     if request_id:
         headers["PayPal-Request-Id"] = request_id
+
+    if prefer:
+        headers["Prefer"] = prefer
 
     timeout = settings.paypal_api_timeout_seconds
 
@@ -122,19 +156,49 @@ async def paypal_request(
                 url=url,
                 headers=headers,
                 json=payload,
+                params=params,
             )
 
-            response.raise_for_status()
+            if response.is_error:
+                try:
+                    error_data = response.json()
+                except ValueError:
+                    error_data = {
+                        "raw_response": response.text
+                    }
 
-            if not response.content:
+                logger.error(
+                    "PayPal API error. HTTP %s. Full response: %s",
+                    response.status_code,
+                    error_data,
+                )
+
+                details = error_data.get("details", [])
+
+                error_messages = []
+
+                for item in details:
+                    error_messages.append(
+                        f"Field: {item.get('field', 'Unknown')}, "
+                        f"Issue: {item.get('issue', 'Unknown')}, "
+                        f"Description: {item.get('description', 'No description')}"
+                    )
+
+                raise PayPalError(
+                    f"PayPal API request failed with HTTP "
+                    f"{response.status_code}: "
+                    f"{error_data.get('message', 'Unknown error')}. "
+                    f"Details: {'; '.join(error_messages)}"
+                )
+            # Some PayPal operations return HTTP 204.
+            if response.status_code == 204 or not response.content:
                 return {}
 
             return response.json()
 
-        except httpx.HTTPStatusError as exc:
+        except httpx.TimeoutException as exc:
             raise PayPalError(
-                f"PayPal request failed with HTTP "
-                f"{exc.response.status_code}."
+                "PayPal request timed out."
             ) from exc
 
         except httpx.HTTPError as exc:
@@ -143,89 +207,55 @@ async def paypal_request(
             ) from exc
 
 
-# ---------------------------------------------------------
-# 4. CREATE A STANDARD CHECKOUT ORDER
-# ---------------------------------------------------------
 
-async def create_order(
+# =========================================================
+# 4. CREATE PAYPAL INVOICE
+# =========================================================
+
+async def create_invoice(
+    customer_email: str,
+    plan_name: str,
     amount: str,
     currency: str,
-    subscription_id: str,
-    plan_name: str,
-    request_id: str | None = None,
-):
-    payload = {
-        "intent": "CAPTURE",
-        "purchase_units": [
-            {
-                "reference_id": subscription_id,
-                "custom_id": subscription_id,
-                "description": plan_name,
-                "amount": {
-                    "currency_code": currency,
-                    "value": amount,
-                },
-            }
-        ],
-    }
-
-    return await paypal_request(
-        method="POST",
-        path="/v2/checkout/orders",
-        payload=payload,
-        request_id=request_id,
-    )
-
-
-# ---------------------------------------------------------
-# 5. CREATE A CARD CHECKOUT ORDER WITH VAULTING
-# ---------------------------------------------------------
-
-async def create_card_order(
-    amount: str,
-    currency: str,
-    subscription_id: str,
-    plan_name: str,
-    card_single_use_token: str,
-    request_id: str | None = None,
 ):
     """
-    Creates an initial card payment and requests card vaulting.
-
-    card_single_use_token must be generated through an approved
-    PayPal-hosted card integration.
-
-    Never pass raw card numbers or CVV values to this function.
+    Create a PayPal invoice using the same payload
+    structure as the successful standalone test.
     """
 
-    if not card_single_use_token:
-        raise PayPalError(
-            "A valid PayPal card token is required."
-        )
+    if not customer_email:
+        raise PayPalError("Customer email is required.")
+
+    if not plan_name:
+        raise PayPalError("Subscription plan name is required.")
+
+    if not amount or not currency:
+        raise PayPalError("Invoice amount and currency are required.")
 
     payload = {
-        "intent": "CAPTURE",
-        "payment_source": {
-            "card": {
-                "single_use_token": card_single_use_token,
-                "attributes": {
-                    "verification": {
-                        "method": "SCA_WHEN_REQUIRED",
-                    },
-                    "vault": {
-                        "store_in_vault": "ON_SUCCESS",
-                        "usage_type": "MERCHANT",
-                    },
-                },
+        "detail": {
+            "currency_code": currency.upper(),
+            "note": "Lumina subscription payment",
+        },
+        "invoicer": {
+            "name": {
+                "given_name": "Lumina",
+                "surname": "Subscriptions",
             }
         },
-        "purchase_units": [
+        "primary_recipients": [
             {
-                "reference_id": subscription_id,
-                "custom_id": subscription_id,
-                "description": plan_name,
-                "amount": {
-                    "currency_code": currency,
+                "billing_info": {
+                    "email_address": customer_email,
+                }
+            }
+        ],
+        "items": [
+            {
+                "name": plan_name,
+                "quantity": "1",
+                "unit_amount": {
+                    "currency_code": currency.upper(),
                     "value": amount,
                 },
             }
@@ -234,249 +264,113 @@ async def create_card_order(
 
     return await paypal_request(
         method="POST",
-        path="/v2/checkout/orders",
+        path="/v2/invoicing/invoices",
         payload=payload,
-        request_id=request_id,
+        prefer="return=representation",
     )
+# =========================================================
+# 5. SEND PAYPAL INVOICE TO CUSTOMER
+# =========================================================
 
+async def send_invoice(invoice_id: str):
 
-# ---------------------------------------------------------
-# 6. CAPTURE AN INITIAL PAYMENT
-# ---------------------------------------------------------
-
-async def capture_order(
-    order_id: str,
-    request_id: str | None = None,
-):
-    if not order_id:
-        raise PayPalError(
-            "PayPal order ID is required."
-        )
+    if not invoice_id:
+        raise PayPalError("PayPal invoice ID is required.")
 
     return await paypal_request(
         method="POST",
-        path=f"/v2/checkout/orders/{order_id}/capture",
-        payload={},
-        request_id=request_id,
+        path=f"/v2/invoicing/invoices/{invoice_id}/send",
     )
 
+# =========================================================
+# 6. GET PAYPAL INVOICE DETAILS
+# =========================================================
 
-# ---------------------------------------------------------
-# 7. GET ORDER DETAILS
-# ---------------------------------------------------------
+async def get_invoice(invoice_id: str):
+    """
+    Retrieves the latest PayPal invoice details.
+    """
 
-async def get_order(order_id: str):
-    if not order_id:
+    if not invoice_id:
         raise PayPalError(
-            "PayPal order ID is required."
+            "PayPal invoice ID is required."
         )
 
     return await paypal_request(
         method="GET",
-        path=f"/v2/checkout/orders/{order_id}",
+        path=f"/v2/invoicing/invoices/{invoice_id}",
     )
 
 
-# ---------------------------------------------------------
-# 8. GET SAVED PAYMENT TOKEN DETAILS
-# ---------------------------------------------------------
+# =========================================================
+# 7. SEARCH PAYPAL INVOICES
+# =========================================================
 
-async def get_payment_token(vault_id: str):
-    if not vault_id:
+async def search_invoices(search_payload: dict):
+    """
+    Searches PayPal invoices using the Invoicing API.
+    """
+
+    if not isinstance(search_payload, dict):
         raise PayPalError(
-            "PayPal vault ID is required."
+            "Invoice search payload must be a dictionary."
         )
 
     return await paypal_request(
-        method="GET",
-        path=f"/v3/vault/payment-tokens/{vault_id}",
+        method="POST",
+        path="/v2/invoicing/search-invoices",
+        payload=search_payload,
     )
 
 
-# ---------------------------------------------------------
-# 9. CREATE A RECURRING PAYMENT ORDER
-# ---------------------------------------------------------
+# =========================================================
+# 8. SEND PAYMENT REMINDER
+# =========================================================
 
-async def create_recurring_charge(
-    amount: str,
-    currency: str,
-    vault_id: str,
-    subscription_id: str,
-    plan_name: str,
-    previous_transaction_reference: str,
-    request_id: str,
-):
+async def send_invoice_reminder(invoice_id: str):
     """
-    Creates a merchant-initiated recurring payment order
-    using a previously saved PayPal card token.
-
-    This function creates the order only.
-    Call capture_recurring_charge() afterwards to collect payment.
-
-    previous_transaction_reference must identify the qualifying
-    original customer-authorized transaction.
+    Sends a reminder for an existing unpaid invoice.
     """
 
-    if not vault_id:
+    if not invoice_id:
         raise PayPalError(
-            "A saved PayPal payment token is required."
+            "PayPal invoice ID is required."
         )
 
-    if not previous_transaction_reference:
-        raise PayPalError(
-            "The previous transaction reference is required."
-        )
-
-    if not request_id:
-        raise PayPalError(
-            "A unique request ID is required for recurring billing."
-        )
-
-    payload = {
-        "intent": "CAPTURE",
-        "payment_source": {
-            "card": {
-                "vault_id": vault_id,
-                "stored_credential": {
-                    "payment_initiator": "MERCHANT",
-                    "payment_type": "RECURRING",
-                    "usage": "SUBSEQUENT",
-                    "previous_transaction_reference": (
-                        previous_transaction_reference
-                    ),
-                },
-            }
+    return await paypal_request(
+        method="POST",
+        path=f"/v2/invoicing/invoices/{invoice_id}/remind",
+        payload={
+            "send_to_recipient": True,
+            "send_to_invoicer": False,
         },
-        "purchase_units": [
-            {
-                "reference_id": subscription_id,
-                "custom_id": subscription_id,
-                "description": plan_name,
-                "amount": {
-                    "currency_code": currency,
-                    "value": amount,
-                },
-            }
-        ],
-    }
-
-    return await paypal_request(
-        method="POST",
-        path="/v2/checkout/orders",
-        payload=payload,
-        request_id=request_id,
     )
 
 
-# ---------------------------------------------------------
-# 10. CAPTURE A RECURRING PAYMENT
-# ---------------------------------------------------------
+# =========================================================
+# 9. CANCEL PAYPAL INVOICE
+# =========================================================
 
-async def capture_recurring_charge(
-    order_id: str,
-    request_id: str | None = None,
-):
+async def cancel_invoice(invoice_id: str):
     """
-    Captures a recurring payment order created by
-    create_recurring_charge().
+    Cancels an already-sent unpaid invoice.
     """
 
-    if not order_id:
+    if not invoice_id:
         raise PayPalError(
-            "PayPal recurring order ID is required."
+            "PayPal invoice ID is required."
         )
 
     return await paypal_request(
         method="POST",
-        path=f"/v2/checkout/orders/{order_id}/capture",
-        payload={},
-        request_id=request_id,
+        path=f"/v2/invoicing/invoices/{invoice_id}/cancel",
+        payload={
+            "subject": "Lumina invoice cancelled",
+            "note": (
+                "This invoice has been cancelled. "
+                "Please contact Lumina if you still wish to subscribe."
+            ),
+            "send_to_recipient": True,
+            "send_to_invoicer": False,
+        },
     )
-
-
-# ---------------------------------------------------------
-# 11. DELETE A SAVED PAYMENT TOKEN
-# ---------------------------------------------------------
-
-async def delete_payment_token(vault_id: str):
-    """
-    Deletes a saved PayPal payment token.
-
-    Only call after confirming that the token belongs
-    to the authenticated customer's payment method.
-    """
-
-    if not vault_id:
-        raise PayPalError(
-            "PayPal vault ID is required."
-        )
-
-    return await paypal_request(
-        method="DELETE",
-        path=f"/v3/vault/payment-tokens/{vault_id}",
-    )
-
-
-async def verify_webhook_signature(
-    headers: dict,
-    webhook_event: dict,
-) -> bool:
-    """
-    Ask PayPal to verify the authenticity of an incoming webhook.
-
-    Returns True only when PayPal confirms the signature.
-    """
-
-    webhook_id = settings.paypal_webhook_id
-
-    if not webhook_id:
-        raise PayPalError(
-            "PayPal webhook ID is not configured."
-        )
-
-    required_headers = {
-        "auth_algo": headers.get("paypal-auth-algo"),
-        "cert_url": headers.get("paypal-cert-url"),
-        "transmission_id": headers.get("paypal-transmission-id"),
-        "transmission_sig": headers.get("paypal-transmission-sig"),
-        "transmission_time": headers.get("paypal-transmission-time"),
-    }
-
-    # Reject requests that do not contain all required PayPal headers.
-    if any(not value for value in required_headers.values()):
-        return False
-
-    payload = {
-        **required_headers,
-        "webhook_id": webhook_id,
-        "webhook_event": webhook_event,
-    }
-
-    try:
-        response = await paypal_request(
-            method="POST",
-            path="/v1/notifications/verify-webhook-signature",
-            payload=payload,
-        )
-
-    except PayPalError:
-        raise
-
-    except Exception as exc:
-        raise PayPalError(
-            f"Could not verify PayPal webhook: {str(exc)}"
-        ) from exc
-
-    verification_status = response.get("verification_status")
-
-    if verification_status != "SUCCESS":
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-        logger.warning(
-            "PayPal webhook verification returned: %s",
-            verification_status,
-        )
-
-    return verification_status == "SUCCESS"

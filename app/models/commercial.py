@@ -66,6 +66,7 @@ class PlanEntitlement(Base):
     platform_id = Column(UUID(as_uuid=True), ForeignKey("streaming_platforms.id", ondelete="RESTRICT"), primary_key=True)
 
 
+
 class Subscription(Base):
     __tablename__ = "subscriptions"
 
@@ -84,7 +85,9 @@ class Subscription(Base):
         nullable=False,
     )
 
-    status = Column(String(30), default="active", nullable=False)
+    # A subscription starts pending and is activated only
+    # after Lumina verifies successful payment.
+    status = Column(String(30), default="pending", nullable=False)
 
     provider = Column(String(50))
     provider_customer_id = Column(String(200))
@@ -92,6 +95,12 @@ class Subscription(Base):
 
     current_period_start = Column(DateTime(timezone=True))
     current_period_end = Column(DateTime(timezone=True))
+
+    # Next date on which Lumina should generate a renewal invoice.
+    next_billing_at = Column(DateTime(timezone=True))
+
+    # Optional grace period after an unpaid renewal.
+    grace_period_ends_at = Column(DateTime(timezone=True))
 
     cancel_at_period_end = Column(Boolean, default=False, nullable=False)
     cancelled_at = Column(DateTime(timezone=True))

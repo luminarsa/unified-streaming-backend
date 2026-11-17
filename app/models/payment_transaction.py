@@ -27,7 +27,7 @@ class PaymentTransaction(Base):
         default=uuid.uuid4,
     )
 
-    # Account that made the payment
+    # Account that made the payment.
     account_id = Column(
         UUID(as_uuid=True),
         ForeignKey("accounts.id", ondelete="CASCADE"),
@@ -36,8 +36,6 @@ class PaymentTransaction(Base):
     )
 
     # Subscription associated with this payment.
-    # Nullable because an initial checkout may fail
-    # before a subscription is created.
     subscription_id = Column(
         UUID(as_uuid=True),
         ForeignKey("subscriptions.id", ondelete="SET NULL"),
@@ -45,31 +43,58 @@ class PaymentTransaction(Base):
         index=True,
     )
 
-    # Payment method used for the transaction
     payment_method_id = Column(
         UUID(as_uuid=True),
         ForeignKey("payment_methods.id", ondelete="SET NULL"),
         nullable=True,
     )
+
     encrypted_vault_token = Column(Text)
-    # PayPal transaction information
+
+    # Payment provider.
     provider = Column(
         String(50),
         nullable=False,
         default="paypal",
     )
 
+    # Legacy PayPal Orders/Capture fields.
+    # Retained for historical transactions.
     provider_order_id = Column(String(200))
     provider_capture_id = Column(String(200))
     provider_transaction_id = Column(String(200))
 
-    # Transaction type
+    # New PayPal Invoicing fields.
+    provider_invoice_id = Column(String(200), unique=True)
+    provider_invoice_number = Column(String(100))
+    provider_invoice_url = Column(Text)
+    provider_invoice_status = Column(String(50))
+    # Identifies one checkout attempt so retries cannot
+    # accidentally create duplicate subscription payments.
+    idempotency_key = Column(String(100), nullable=True)
+    # Unique Lumina transaction reference is this row's UUID (id).
+
+    # Payment reconciliation information.
+    provider_payment_date = Column(DateTime(timezone=True))
+    last_reconciled_at = Column(DateTime(timezone=True))
+
+    # Invoice reminder management.
+    reminder_count = Column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    next_reminder_at = Column(DateTime(timezone=True))
+    invoice_expires_at = Column(DateTime(timezone=True))
+
+    # Transaction type.
     transaction_type = Column(
         String(30),
         nullable=False,
     )
 
-    # Payment amount and currency
+    # Payment amount and currency.
     amount = Column(
         Numeric(12, 2),
         nullable=False,
@@ -81,25 +106,25 @@ class PaymentTransaction(Base):
         default="USD",
     )
 
-    # Transaction status
+    # Lumina transaction status.
     status = Column(
         String(30),
         nullable=False,
         default="pending",
     )
 
-    # Billing period associated with this transaction
+    # Billing period associated with this transaction.
     billing_period_start = Column(DateTime(timezone=True))
     billing_period_end = Column(DateTime(timezone=True))
 
-    # PayPal failure or response information
+    # PayPal failure or response information.
     failure_code = Column(String(100))
     failure_message = Column(Text)
 
-    # PayPal webhook event identifier
+    # Retained for legacy webhook records.
     webhook_event_id = Column(String(200))
 
-    # Timestamps
+    # Timestamps.
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -120,6 +145,11 @@ class PaymentTransaction(Base):
             "amount >= 0",
             name="check_payment_transaction_amount",
         ),
+        UniqueConstraint(
+            "account_id",
+            "idempotency_key",
+            name="uq_payment_transaction_account_idempotency",
+        ),
         CheckConstraint(
             "transaction_type IN ('initial', 'renewal', 'plan_change', 'refund')",
             name="check_payment_transaction_type",
@@ -127,6 +157,10 @@ class PaymentTransaction(Base):
         CheckConstraint(
             "status IN ('pending', 'processing', 'completed', 'failed', 'cancelled', 'refunded')",
             name="check_payment_transaction_status",
+        ),
+        CheckConstraint(
+            "reminder_count >= 0",
+            name="check_payment_transaction_reminder_count",
         ),
         UniqueConstraint(
             "provider_capture_id",

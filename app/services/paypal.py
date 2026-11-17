@@ -1,376 +1,295 @@
 
+import os
 import base64
-import logging
-import hashlib
 import httpx
 
-from app.core.config import settings
+from decimal import Decimal, InvalidOperation
 
 
-logger = logging.getLogger(__name__)
-
-
-class PayPalError(RuntimeError):
-    pass
-
-def get_paypal_diagnostics():
-    client_id, _ = get_paypal_credentials()
-
-    fingerprint = hashlib.sha256(
-        client_id.encode("utf-8")
-    ).hexdigest()[:12]
-
-    return {
-        "environment": settings.paypal_environment,
-        "base_url": get_paypal_base_url(),
-        "client_id_fingerprint": fingerprint,
-    }
 # =========================================================
-# 1. PAYPAL CONFIGURATION
+# PAYPAL CONFIGURATION
 # =========================================================
 
-async def inspect_paypal_identity():
-    return await paypal_request(
-        method="GET",
-        path="/v1/identity/oauth2/userinfo",
-        params={"schema": "paypalv1.1"},
-    )
+PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
+PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
 
-def get_paypal_base_url() -> str:
-    if settings.paypal_environment.lower() == "live":
-        return "https://api-m.paypal.com"
+PAYPAL_ENVIRONMENT = os.getenv(
+    "PAYPAL_ENVIRONMENT",
+    "sandbox"
+).lower()
 
-    return "https://api-m.sandbox.paypal.com"
+if PAYPAL_ENVIRONMENT == "live":
+    PAYPAL_BASE_URL = "https://api-m.paypal.com"
+else:
+    PAYPAL_BASE_URL = "https://api-m.sandbox.paypal.com"
+
+PAYPAL_TIMEOUT = float(
+    os.getenv("PAYPAL_API_TIMEOUT_SECONDS", "30")
+)
 
 
-def get_paypal_credentials():
-    client_id = settings.paypal_client_id
-    client_secret = settings.paypal_client_secret
+# =========================================================
+# 1. AUTHENTICATE WITH PAYPAL
+# =========================================================
 
-    if not client_id or not client_secret:
-        raise PayPalError(
-            "PayPal client ID or client secret is missing."
+async def get_paypal_access_token(client: httpx.AsyncClient) -> str:
+
+    if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
+        raise ValueError(
+            "PayPal credentials are missing from environment variables."
         )
 
-    return client_id, client_secret
-
-
-# =========================================================
-# 2. PAYPAL AUTHENTICATION
-# =========================================================
-
-async def get_access_token() -> str:
-    client_id, client_secret = get_paypal_credentials()
-
-    credentials = f"{client_id}:{client_secret}"
+    credentials = (
+        f"{PAYPAL_CLIENT_ID}:{PAYPAL_CLIENT_SECRET}"
+    )
 
     encoded_credentials = base64.b64encode(
         credentials.encode("utf-8")
     ).decode("utf-8")
 
-    url = f"{get_paypal_base_url()}/v1/oauth2/token"
+    response = await client.post(
+        f"{PAYPAL_BASE_URL}/v1/oauth2/token",
+        headers={
+            "Authorization": f"Basic {encoded_credentials}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data={
+            "grant_type": "client_credentials"
+        },
+    )
 
-    headers = {
-        "Authorization": f"Basic {encoded_credentials}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
+    response.raise_for_status()
 
-    timeout = settings.paypal_api_timeout_seconds
+    token_data = response.json()
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            response = await client.post(
-                url,
-                headers=headers,
-                data={
-                    "grant_type": "client_credentials",
-                },
-            )
+    access_token = token_data.get("access_token")
 
-            response.raise_for_status()
+    if not access_token:
+        raise RuntimeError(
+            "PayPal authentication did not return an access token."
+        )
 
-            data = response.json()
-
-            access_token = data.get("access_token")
-
-            if not access_token:
-                raise PayPalError(
-                    "PayPal did not return an access token."
-                )
-
-            return access_token
-
-        except httpx.HTTPStatusError as exc:
-            logger.error(
-                "PayPal authentication failed: HTTP %s",
-                exc.response.status_code,
-            )
-
-            raise PayPalError(
-                "PayPal authentication failed."
-            ) from exc
-
-        except httpx.HTTPError as exc:
-            raise PayPalError(
-                "Unable to connect to PayPal authentication."
-            ) from exc
+    return access_token
 
 
 # =========================================================
-# 3. COMMON PAYPAL API REQUEST
+# 2. CREATE AND SEND PAYPAL INVOICE
 # =========================================================
-
-async def paypal_request(
-    method: str,
-    path: str,
-    payload: dict | None = None,
-    params: dict | None = None,
-    request_id: str | None = None,
-    prefer: str | None = None,
-):
-    access_token = await get_access_token()
-
-    url = f"{get_paypal_base_url()}{path}"
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    # PayPal idempotency key.
-    # Reusing the same key for a retry helps prevent
-    # duplicate invoice creation.
-    if request_id:
-        headers["PayPal-Request-Id"] = request_id
-
-    if prefer:
-        headers["Prefer"] = prefer
-
-    timeout = settings.paypal_api_timeout_seconds
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            response = await client.request(
-                method=method,
-                url=url,
-                headers=headers,
-                json=payload,
-                params=params,
-            )
-
-            if response.is_error:
-                try:
-                    error_data = response.json()
-                except ValueError:
-                    error_data = {
-                        "raw_response": response.text
-                    }
-
-                logger.error(
-                    "PayPal API error. HTTP %s. Full response: %s",
-                    response.status_code,
-                    error_data,
-                )
-
-                details = error_data.get("details", [])
-
-                error_messages = []
-
-                for item in details:
-                    error_messages.append(
-                        f"Field: {item.get('field', 'Unknown')}, "
-                        f"Issue: {item.get('issue', 'Unknown')}, "
-                        f"Description: {item.get('description', 'No description')}"
-                    )
-
-                raise PayPalError(
-                    f"PayPal API request failed with HTTP "
-                    f"{response.status_code}: "
-                    f"{error_data.get('message', 'Unknown error')}. "
-                    f"Details: {'; '.join(error_messages)}"
-                )
-            # Some PayPal operations return HTTP 204.
-            if response.status_code == 204 or not response.content:
-                return {}
-
-            return response.json()
-
-        except httpx.TimeoutException as exc:
-            raise PayPalError(
-                "PayPal request timed out."
-            ) from exc
-
-        except httpx.HTTPError as exc:
-            raise PayPalError(
-                "Unable to communicate with PayPal."
-            ) from exc
-
 
 
 # =========================================================
-# 4. CREATE PAYPAL INVOICE
+# LUMINA INVOICE BRANDING
 # =========================================================
 
-async def create_invoice(
+LUMINA_BUSINESS_NAME = "Lumina"
+LUMINA_WEBSITE = "https://luminatv.com"
+
+LUMINA_LOGO_URL = (
+    "https://ik.imagekit.io/sobl5vhb4/"
+    "Lumina%20TV%20Logos/Lumina%20Logo.webp"
+)
+
+
+# =========================================================
+# CREATE AND SEND PAYPAL INVOICE
+# =========================================================
+
+async def create_paypal_checkout(
+    customer_name: str,
     customer_email: str,
     plan_name: str,
+    subscription_id: str,
+    subscription_period: str,
     amount: str,
-    currency: str,
+    currency: str = "USD",
 ):
-    """
-    Create a PayPal invoice using the same payload
-    structure as the successful standalone test.
-    """
+
+    if not customer_name:
+        raise ValueError("Customer name is required.")
 
     if not customer_email:
-        raise PayPalError("Customer email is required.")
+        raise ValueError("Customer email is required.")
 
     if not plan_name:
-        raise PayPalError("Subscription plan name is required.")
+        raise ValueError("Plan name is required.")
 
-    if not amount or not currency:
-        raise PayPalError("Invoice amount and currency are required.")
+    if not subscription_id:
+        raise ValueError("Subscription ID is required.")
 
-    payload = {
-        "detail": {
-            "currency_code": currency.upper(),
-            "note": "Lumina subscription payment",
-        },
-        "invoicer": {
-            "name": {
-                "given_name": "Lumina",
-                "surname": "Subscriptions",
-            }
-        },
-        "primary_recipients": [
-            {
-                "billing_info": {
-                    "email_address": customer_email,
-                }
-            }
-        ],
-        "items": [
-            {
-                "name": plan_name,
-                "quantity": "1",
-                "unit_amount": {
-                    "currency_code": currency.upper(),
-                    "value": amount,
+    if not subscription_period:
+        raise ValueError("Subscription period is required.")
+
+    try:
+        invoice_amount = Decimal(str(amount))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("Invalid invoice amount.") from exc
+
+    if not invoice_amount.is_finite() or invoice_amount <= 0:
+        raise ValueError("Invoice amount must be greater than zero.")
+
+    currency = currency.upper()
+
+    # Split the profile name into PayPal's given_name
+    # and surname fields.
+    name_parts = customer_name.strip().split(maxsplit=1)
+
+    given_name = name_parts[0]
+    surname = name_parts[1] if len(name_parts) > 1 else ""
+
+    # -----------------------------------------------------
+    # CONNECT TO PAYPAL
+    # -----------------------------------------------------
+
+    async with httpx.AsyncClient(
+        timeout=PAYPAL_TIMEOUT
+    ) as client:
+
+        access_token = await get_paypal_access_token(client)
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        # -------------------------------------------------
+        # STEP 1: BUILD INVOICE
+        # -------------------------------------------------
+
+        payload = {
+            "detail": {
+                "currency_code": currency,
+
+                # Make the Lumina subscription ID visible
+                # as the invoice reference.
+                "reference": subscription_id,
+
+                # Payment must be made immediately.
+                "payment_term": {
+                    "term_type": "DUE_ON_RECEIPT",
                 },
-            }
-        ],
-    }
 
-    return await paypal_request(
-        method="POST",
-        path="/v2/invoicing/invoices",
-        payload=payload,
-        prefer="return=representation",
-    )
-# =========================================================
-# 5. SEND PAYPAL INVOICE TO CUSTOMER
-# =========================================================
+                # Visible invoice note.
+                "note": (
+                    f"Subscription period: {subscription_period}"
+                ),
+            },
 
-async def send_invoice(invoice_id: str):
+            # Lumina business information.
+            "invoicer": {
+                "business_name": LUMINA_BUSINESS_NAME,
 
-    if not invoice_id:
-        raise PayPalError("PayPal invoice ID is required.")
+                "name": {
+                    "given_name": "Lumina",
+                    "surname": "Subscriptions",
+                },
 
-    return await paypal_request(
-        method="POST",
-        path=f"/v2/invoicing/invoices/{invoice_id}/send",
-    )
+                "website": LUMINA_WEBSITE,
+                "logo_url": LUMINA_LOGO_URL,
+            },
 
-# =========================================================
-# 6. GET PAYPAL INVOICE DETAILS
-# =========================================================
+            # Customer information.
+            # No shipping_info is supplied.
+            "primary_recipients": [
+                {
+                    "billing_info": {
+                        "name": {
+                            "given_name": given_name,
+                            "surname": surname,
+                        },
+                        "email_address": customer_email,
+                    }
+                }
+            ],
 
-async def get_invoice(invoice_id: str):
-    """
-    Retrieves the latest PayPal invoice details.
-    """
+            # Subscription line item.
+            "items": [
+                {
+                    "name": plan_name,
+                    "description": (
+                        f"Subscription ID: {subscription_id}\n"
+                        f"Subscription period: {subscription_period}"
+                    ),
+                    "quantity": "1",
+                    "unit_amount": {
+                        "currency_code": currency,
+                        "value": format(invoice_amount, ".2f"),
+                    },
+                }
+            ],
+        }
 
-    if not invoice_id:
-        raise PayPalError(
-            "PayPal invoice ID is required."
+        # -------------------------------------------------
+        # STEP 2: CREATE INVOICE
+        # -------------------------------------------------
+
+        create_response = await client.post(
+            f"{PAYPAL_BASE_URL}/v2/invoicing/invoices",
+            headers={
+                **headers,
+                "Prefer": "return=representation",
+            },
+            json=payload,
         )
 
-    return await paypal_request(
-        method="GET",
-        path=f"/v2/invoicing/invoices/{invoice_id}",
-    )
+        create_response.raise_for_status()
 
+        invoice_data = create_response.json()
 
-# =========================================================
-# 7. SEARCH PAYPAL INVOICES
-# =========================================================
+        invoice_id = invoice_data.get("id")
 
-async def search_invoices(search_payload: dict):
-    """
-    Searches PayPal invoices using the Invoicing API.
-    """
+        if not invoice_id:
+            raise RuntimeError(
+                "PayPal did not return an invoice ID."
+            )
 
-    if not isinstance(search_payload, dict):
-        raise PayPalError(
-            "Invoice search payload must be a dictionary."
+        # -------------------------------------------------
+        # STEP 3: SEND INVOICE
+        # -------------------------------------------------
+
+        send_response = await client.post(
+            f"{PAYPAL_BASE_URL}/v2/invoicing/invoices/{invoice_id}/send",
+            headers=headers,
         )
 
-    return await paypal_request(
-        method="POST",
-        path="/v2/invoicing/search-invoices",
-        payload=search_payload,
-    )
+        send_response.raise_for_status()
 
+        # -------------------------------------------------
+        # STEP 4: EXTRACT CUSTOMER PAYMENT URL
+        # -------------------------------------------------
 
-# =========================================================
-# 8. SEND PAYMENT REMINDER
-# =========================================================
+        invoice_url = None
 
-async def send_invoice_reminder(invoice_id: str):
-    """
-    Sends a reminder for an existing unpaid invoice.
-    """
+        if send_response.content:
+            send_data = send_response.json()
 
-    if not invoice_id:
-        raise PayPalError(
-            "PayPal invoice ID is required."
-        )
+            if send_data.get("rel") == "payer-view":
+                invoice_url = send_data.get("href")
 
-    return await paypal_request(
-        method="POST",
-        path=f"/v2/invoicing/invoices/{invoice_id}/remind",
-        payload={
-            "send_to_recipient": True,
-            "send_to_invoicer": False,
-        },
-    )
+        # If the send response does not include the payer URL,
+        # try the links returned when the invoice was created.
+        if not invoice_url:
+            for link in invoice_data.get("links", []):
+                if link.get("rel") == "payer-view":
+                    invoice_url = link.get("href")
+                    break
 
+        if not invoice_url:
+            raise RuntimeError(
+                "PayPal sent the invoice but did not return "
+                "a customer payment URL."
+            )
 
-# =========================================================
-# 9. CANCEL PAYPAL INVOICE
-# =========================================================
+        # -------------------------------------------------
+        # STEP 5: RETURN CHECKOUT INFORMATION
+        # -------------------------------------------------
 
-async def cancel_invoice(invoice_id: str):
-    """
-    Cancels an already-sent unpaid invoice.
-    """
-
-    if not invoice_id:
-        raise PayPalError(
-            "PayPal invoice ID is required."
-        )
-
-    return await paypal_request(
-        method="POST",
-        path=f"/v2/invoicing/invoices/{invoice_id}/cancel",
-        payload={
-            "subject": "Lumina invoice cancelled",
-            "note": (
-                "This invoice has been cancelled. "
-                "Please contact Lumina if you still wish to subscribe."
-            ),
-            "send_to_recipient": True,
-            "send_to_invoicer": False,
-        },
-    )
+        return {
+            "success": True,
+            "invoice_id": invoice_id,
+            "invoice_status": "SENT",
+            "invoice_url": invoice_url,
+            "payment_status": "pending",
+            "amount": format(invoice_amount, ".2f"),
+            "currency": currency,
+        }

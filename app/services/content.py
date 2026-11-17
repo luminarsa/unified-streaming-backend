@@ -547,6 +547,7 @@ def _merge_unified_titles(
 
 
 
+
 def _unified_discovery_collection(
     db: Session,
     tmdb: TMDBClient,
@@ -560,17 +561,26 @@ def _unified_discovery_collection(
 ) -> list[dict]:
     """
     Discover titles across entitled platforms using combined
-    provider IDs. Make one discovery flow per media type and
-    regional/language group rather than one per platform.
+    provider IDs.
+
+    Platforms are grouped by region and language because TMDB
+    accepts only one watch_region and language per request.
+
+    Provider IDs are combined separately for movies and TV,
+    using only platforms that support the requested media type.
 
     Shared results are not assigned a false per-title
     available_on attribution. Exact availability requires
     provider verification.
     """
+
     genre_ids = genre_ids or []
     overrides = overrides or {}
 
-    # Load platform configurations in one query.
+    # -------------------------------------------------
+    # 1. Load platform configurations
+    # -------------------------------------------------
+
     platform_ids = [platform.id for platform in platforms]
 
     if not platform_ids:
@@ -578,43 +588,68 @@ def _unified_discovery_collection(
 
     configs = db.scalars(
         select(PlatformProfile).where(
-            PlatformProfile.platform_id.in_(platform_ids)
+            PlatformProfile.platform_id.in_(platform_ids),
+            PlatformProfile.enabled.is_(True),
         )
     ).all()
 
     config_by_platform = {
-        config.platform_id: config for config in configs
+        config.platform_id: config
+        for config in configs
     }
 
-    # Group platforms by region and language. TMDB accepts only
-    # one watch_region and language per discovery request.
+    # Only include platforms with an enabled configuration.
+    eligible_platforms = [
+        platform
+        for platform in platforms
+        if platform.id in config_by_platform
+    ]
+
+    if not eligible_platforms:
+        return []
+
+    eligible_platform_ids = [
+        platform.id
+        for platform in eligible_platforms
+    ]
+
+    # -------------------------------------------------
+    # 2. Group platforms by region and language
+    # -------------------------------------------------
+
     groups = {}
 
-    for platform in platforms:
-        config = config_by_platform.get(platform.id)
+    for platform in eligible_platforms:
+        config = config_by_platform[platform.id]
 
         region_code = (
-            config.region_code
-            if config and config.region_code
-            else settings.tmdb_region
+            config.region_code or settings.tmdb_region
         )
+
         language = (
-            config.language
-            if config and config.language
-            else settings.tmdb_language
+            config.language or settings.tmdb_language
         )
 
         group_key = (region_code, language)
 
         groups.setdefault(
             group_key,
-            {"platforms": [], "provider_ids": set()},
+            {
+                "platforms": [],
+                "regional_by_platform": {},
+                "global_by_platform": {},
+            },
         )["platforms"].append(platform)
 
-    # Load all provider mappings for these platforms in one query.
+    # -------------------------------------------------
+    # 3. Load provider mappings in one database query
+    # -------------------------------------------------
+
     provider_rows = db.scalars(
         select(PlatformProvider).where(
-            PlatformProvider.platform_id.in_(platform_ids),
+            PlatformProvider.platform_id.in_(
+                eligible_platform_ids
+            ),
             PlatformProvider.provider_kind.in_(
                 ["watch_provider", "tmdb_watch_provider"]
             ),
@@ -622,74 +657,69 @@ def _unified_discovery_collection(
     ).all()
 
     for provider in provider_rows:
-        config = config_by_platform.get(provider.platform_id)
+
+        config = config_by_platform.get(
+            provider.platform_id
+        )
+
+        if config is None:
+            continue
+
         region_code = (
-            config.region_code
-            if config and config.region_code
-            else settings.tmdb_region
+            config.region_code or settings.tmdb_region
         )
 
         language = (
-            config.language
-            if config and config.language
-            else settings.tmdb_language
+            config.language or settings.tmdb_language
         )
 
-        group = groups[(region_code, language)]
+        group = groups.get((region_code, language))
 
-        # Prefer regional mappings. Global mappings are used only
-        # if a platform has no mapping for the requested region.
-        group.setdefault("regional_by_platform", {}).setdefault(
-            provider.platform_id, []
-        )
-        group.setdefault("global_by_platform", {}).setdefault(
-            provider.platform_id, []
-        )
+        if group is None:
+            continue
 
         if provider.external_id is None:
             continue
 
+        provider_mapping = (
+            int(provider.external_id),
+            provider.is_primary,
+        )
+
+        # Regional mappings take priority.
         if provider.region_code == region_code:
-            group["regional_by_platform"][provider.platform_id].append(
-                (int(provider.external_id), provider.is_primary)
-            )
+
+            group["regional_by_platform"].setdefault(
+                provider.platform_id,
+                [],
+            ).append(provider_mapping)
+
+        # Global mappings are fallback mappings.
         elif provider.region_code is None:
-            group["global_by_platform"][provider.platform_id].append(
-                (int(provider.external_id), provider.is_primary)
-            )
+
+            group["global_by_platform"].setdefault(
+                provider.platform_id,
+                [],
+            ).append(provider_mapping)
+
+    # -------------------------------------------------
+    # 4. Discover titles for each region/language group
+    # -------------------------------------------------
 
     merged = {}
 
     for (region_code, language), group in groups.items():
-        provider_ids = set()
 
-        for platform in group["platforms"]:
-            regional = group.get(
-                "regional_by_platform", {}
-            ).get(platform.id, [])
-
-            global_mappings = group.get(
-                "global_by_platform", {}
-            ).get(platform.id, [])
-
-            candidates = regional or global_mappings
-            primary = [
-                provider_id
-                for provider_id, is_primary in candidates
-                if is_primary
-            ]
-
-            selected = primary or [
-                provider_id
-                for provider_id, _ in candidates
-            ]
-
-            provider_ids.update(selected)
-
-        if not provider_ids:
-            continue
-
+        # Process movies and TV separately.
         for media_type in media_types:
+
+            if media_type not in {"movie", "tv"}:
+                continue
+
+            # -----------------------------------------
+            # 4A. Identify platforms supporting this type
+            # -----------------------------------------
+
             supported_platforms = [
                 platform
                 for platform in group["platforms"]
@@ -703,25 +733,90 @@ def _unified_discovery_collection(
             if not supported_platforms:
                 continue
 
+            # -----------------------------------------
+            # 4B. Build provider IDs for this media type
+            # -----------------------------------------
+
+            provider_ids = set()
+
+            for platform in supported_platforms:
+
+                regional = group[
+                    "regional_by_platform"
+                ].get(platform.id, [])
+
+                global_mappings = group[
+                    "global_by_platform"
+                ].get(platform.id, [])
+
+                # Use regional mappings first.
+                # Fall back to global mappings only when
+                # no regional mapping exists for the platform.
+                candidates = regional or global_mappings
+
+                # Prefer primary providers when available.
+                primary = [
+                    provider_id
+                    for provider_id, is_primary in candidates
+                    if is_primary
+                ]
+
+                selected = primary or [
+                    provider_id
+                    for provider_id, _ in candidates
+                ]
+
+                provider_ids.update(selected)
+
+            if not provider_ids:
+                continue
+
+            # -----------------------------------------
+            # 4C. Select TMDB discovery endpoint
+            # -----------------------------------------
+
             endpoint = (
                 "/discover/movie"
                 if media_type == "movie"
                 else "/discover/tv"
             )
 
+            # -----------------------------------------
+            # 4D. Prepare media-specific overrides
+            # -----------------------------------------
+
             effective_overrides = dict(overrides)
 
-            # Do not send movie-only date filters to TV discovery,
-            # or TV-only date filters to movie discovery.
+            # Remove date filters that do not apply
+            # to the selected media type.
             if media_type == "movie":
-                effective_overrides.pop("first_air_date.gte", None)
-                effective_overrides.pop("first_air_date.lte", None)
-            else:
-                effective_overrides.pop("primary_release_date.gte", None)
-                effective_overrides.pop("primary_release_date.lte", None)
 
-            # The unified endpoint needs only enough results for the
-            # requested collection, rather than a large candidate pool.
+                effective_overrides.pop(
+                    "first_air_date.gte",
+                    None,
+                )
+
+                effective_overrides.pop(
+                    "first_air_date.lte",
+                    None,
+                )
+
+            else:
+
+                effective_overrides.pop(
+                    "primary_release_date.gte",
+                    None,
+                )
+
+                effective_overrides.pop(
+                    "primary_release_date.lte",
+                    None,
+                )
+
+            # -----------------------------------------
+            # 4E. Fetch discovery results from TMDB
+            # -----------------------------------------
+
             results = _fetch_discovery(
                 tmdb=tmdb,
                 endpoint=endpoint,
@@ -736,41 +831,92 @@ def _unified_discovery_collection(
                 kids_mode=profile.is_kids_profile,
             )
 
+            # -----------------------------------------
+            # 4F. Filter and merge results
+            # -----------------------------------------
+
             for item in results:
-                if not _is_allowed_for_profile(item, profile):
+
+                if not item.get("id"):
                     continue
 
-                key = (media_type, int(item["id"]))
+                if media_type == "movie" and not item.get("title"):
+                    continue
+
+                if media_type == "tv" and not item.get("name"):
+                    continue
+
+                if not _is_allowed_for_profile(
+                    item,
+                    profile,
+                ):
+                    continue
+
+                key = (
+                    media_type,
+                    int(item["id"]),
+                )
 
                 if key not in merged:
-                    merged[key] = _normalise_title(item, media_type)
+
+                    merged[key] = _normalise_title(
+                        item,
+                        media_type,
+                    )
+
+    # -------------------------------------------------
+    # 5. Convert merged results into a list
+    # -------------------------------------------------
 
     results = list(merged.values())
 
+    # -------------------------------------------------
+    # 6. Apply the requested sorting strategy
+    # -------------------------------------------------
+
     if strategy == "top_picks":
+
         preferences = profile.preferences or {}
+
         preferred_genres = {
             int(value)
-            for value in preferences.get("preferred_genres", [])
+            for value in preferences.get(
+                "preferred_genres",
+                [],
+            )
             if str(value).isdigit()
         }
 
         results.sort(
             key=lambda item: _recommendation_score(
-                item, preferred_genres
+                item,
+                preferred_genres,
             ),
             reverse=True,
         )
-    elif strategy in {"newest", "recent", "latest", "new_releases"}:
+
+    elif strategy in {
+        "newest",
+        "recent",
+        "latest",
+        "new_releases",
+    }:
+
         results.sort(
             key=lambda item: item.get("release_date") or "",
             reverse=True,
         )
+
     else:
+
         results.sort(
             key=lambda item: item.get("popularity", 0),
             reverse=True,
         )
+
+    # -------------------------------------------------
+    # 7. Return the requested number of results
+    # -------------------------------------------------
 
     return results[:page_size]
 
@@ -1053,17 +1199,32 @@ def get_unified_home(
     tv_shows = []
     cartoons = []
 
+
     # -----------------------------------------------------
-    # 6. Discover content using entitled platform providers.
+    # 6. Discover the unified candidate pool ONCE.
     # -----------------------------------------------------
+
     if entitled_platforms:
+
         with TMDBClient() as tmdb:
 
+            candidate_pool = get_unified_candidate_pool(
+                db=db,
+                tmdb=tmdb,
+                platforms=entitled_platforms,
+                profile=profile,
+                movie_limit=100,
+                tv_limit=100,
+            )
+
+            # ---------------------------------------------
+            # Build all shared home sliders from candidates.
+            # ---------------------------------------------
+
             for definition in shared_definitions:
-                results = _unified_discovery_collection(
-                    db=db,
-                    tmdb=tmdb,
-                    platforms=entitled_platforms,
+
+                results = build_collection_from_candidates(
+                    candidate_pool=candidate_pool,
                     profile=profile,
                     media_types=definition["media_types"],
                     genre_ids=definition["genres"],
@@ -1084,40 +1245,42 @@ def get_unified_home(
                     "results": results,
                 })
 
-            # Dedicated Movies list.
-            movies = _unified_discovery_collection(
-                db=db,
-                tmdb=tmdb,
-                platforms=entitled_platforms,
+            # ---------------------------------------------
+            # Dedicated Movies collection.
+            # ---------------------------------------------
+
+            movies = build_collection_from_candidates(
+                candidate_pool=candidate_pool,
                 profile=profile,
                 media_types=["movie"],
                 strategy="popular",
                 page_size=30,
             )
 
-            # Dedicated TV Shows / Series list.
-            tv_shows = _unified_discovery_collection(
-                db=db,
-                tmdb=tmdb,
-                platforms=entitled_platforms,
+            # ---------------------------------------------
+            # Dedicated TV Shows collection.
+            # ---------------------------------------------
+
+            tv_shows = build_collection_from_candidates(
+                candidate_pool=candidate_pool,
                 profile=profile,
                 media_types=["tv"],
                 strategy="popular",
                 page_size=30,
             )
 
-            # Dedicated Cartoons list: animation and family genres.
-            cartoons = _unified_discovery_collection(
-                db=db,
-                tmdb=tmdb,
-                platforms=entitled_platforms,
+            # ---------------------------------------------
+            # Dedicated Cartoons collection.
+            # ---------------------------------------------
+
+            cartoons = build_collection_from_candidates(
+                candidate_pool=candidate_pool,
                 profile=profile,
                 media_types=["movie", "tv"],
                 genre_ids=[16, 10751],
                 strategy="popular",
                 page_size=30,
             )
-
     # -----------------------------------------------------
     # 7. Add platform-specific collections.
     #    Shared sliders are not duplicated here.
@@ -1206,6 +1369,213 @@ def get_unified_home(
         },
     }
 
+def get_unified_candidate_pool(
+    db: Session,
+    tmdb: TMDBClient,
+    platforms: list[StreamingPlatform],
+    profile: Profile,
+    movie_limit: int = 100,
+    tv_limit: int = 100,
+) -> dict:
+    """
+    Fetch a reusable collection of movies and TV shows
+    across all platforms included in the user's subscription.
+
+    This function performs discovery once per media type,
+    rather than once for every home-page slider.
+    """
+
+    if not platforms:
+        return {
+            "movies": [],
+            "tv_shows": [],
+        }
+
+    # -------------------------------------------------
+    # 1. Fetch movie candidates across entitled platforms.
+    # -------------------------------------------------
+
+    movies = _unified_discovery_collection(
+        db=db,
+        tmdb=tmdb,
+        platforms=platforms,
+        profile=profile,
+        media_types=["movie"],
+        strategy="popular",
+        page_size=movie_limit,
+    )
+
+    # -------------------------------------------------
+    # 2. Fetch TV show candidates across entitled platforms.
+    # -------------------------------------------------
+
+    tv_shows = _unified_discovery_collection(
+        db=db,
+        tmdb=tmdb,
+        platforms=platforms,
+        profile=profile,
+        media_types=["tv"],
+        strategy="popular",
+        page_size=tv_limit,
+    )
+
+    # -------------------------------------------------
+    # 3. Return the centralized candidate collection.
+    # -------------------------------------------------
+
+    return {
+        "movies": [
+            {**item, "media_type": "movie"}
+            for item in movies
+        ],
+        "tv_shows": [
+            {**item, "media_type": "tv"}
+            for item in tv_shows
+        ],
+    }
+
+
+def build_collection_from_candidates(
+    candidate_pool: dict,
+    profile: Profile,
+    media_types: list[str],
+    genre_ids: list[int] | None = None,
+    overrides: dict | None = None,
+    strategy: str = "popular",
+    page_size: int = 20,
+) -> list[dict]:
+    """
+    Build a content collection from an existing candidate pool.
+
+    No TMDB requests are performed here.
+    """
+
+    genre_ids = genre_ids or []
+    overrides = overrides or {}
+
+    # -------------------------------------------------
+    # 1. Combine the requested media types.
+    # -------------------------------------------------
+
+    candidates = []
+
+    if "movie" in media_types:
+        candidates.extend(candidate_pool.get("movies", []))
+
+    if "tv" in media_types:
+        candidates.extend(candidate_pool.get("tv_shows", []))
+
+    # -------------------------------------------------
+    # 2. Apply genre filtering.
+    # -------------------------------------------------
+
+    results = []
+
+    for item in candidates:
+
+        item_genres = {
+            int(value)
+            for value in item.get("genre_ids", [])
+            if str(value).isdigit()
+        }
+
+        if genre_ids and not item_genres.intersection(
+            set(genre_ids)
+        ):
+            continue
+
+        # -------------------------------------------------
+        # 3. Apply minimum vote-count filtering.
+        # -------------------------------------------------
+
+        minimum_votes = overrides.get("vote_count.gte")
+
+        if minimum_votes is not None:
+            if item.get("vote_count", 0) < minimum_votes:
+                continue
+
+        # -------------------------------------------------
+        # 4. Apply release-date filtering.
+        # -------------------------------------------------
+
+        release_date = item.get("release_date") or ""
+
+        if item.get("media_type") == "movie":
+            date_from = overrides.get(
+                "primary_release_date.gte"
+            )
+            date_to = overrides.get(
+                "primary_release_date.lte"
+            )
+        else:
+            date_from = overrides.get(
+                "first_air_date.gte"
+            )
+            date_to = overrides.get(
+                "first_air_date.lte"
+            )
+
+        if date_from and release_date < date_from:
+            continue
+
+        if date_to and release_date > date_to:
+            continue
+
+        results.append(item)
+
+    # -------------------------------------------------
+    # 5. Apply recommendation ranking.
+    # -------------------------------------------------
+
+    if strategy == "top_picks":
+
+        preferences = profile.preferences or {}
+
+        preferred_genres = {
+            int(value)
+            for value in preferences.get(
+                "preferred_genres", []
+            )
+            if str(value).isdigit()
+        }
+
+        results.sort(
+            key=lambda item: _recommendation_score(
+                item,
+                preferred_genres,
+            ),
+            reverse=True,
+        )
+
+    # -------------------------------------------------
+    # 6. Apply newest-release ranking.
+    # -------------------------------------------------
+
+    elif strategy in {
+        "newest",
+        "recent",
+        "latest",
+        "new_releases",
+    }:
+
+        results.sort(
+            key=lambda item: item.get("release_date") or "",
+            reverse=True,
+        )
+
+    # -------------------------------------------------
+    # 7. Default to popularity ranking.
+    # -------------------------------------------------
+
+    else:
+
+        results.sort(
+            key=lambda item: item.get("popularity", 0),
+            reverse=True,
+        )
+
+    return results[:page_size]
+
 def get_platform_home(
     db: Session,
     platform_id: UUID,
@@ -1270,6 +1640,17 @@ def get_platform_home(
         if str(value).isdigit()
     }
 
+    company_ids = list({
+        company.tmdb_company_id
+        for company in companies
+        if company.tmdb_company_id
+    })
+
+    network_ids = list({
+        network.tmdb_network_id
+        for network in networks
+        if network.tmdb_network_id
+    })
 
     home_sliders = []
 
@@ -1342,9 +1723,6 @@ def get_platform_home(
                 # Supplementary source: mapped companies. Keep the
                 # watch-provider filter in place to avoid adding titles
                 # solely because a company produced them.
-                company_ids = list({
-                    company.tmdb_company_id for company in companies
-                })
 
                 if company_ids:
                     company_results = _fetch_discovery(
@@ -1366,10 +1744,6 @@ def get_platform_home(
 
                 # TV networks are only applicable to TV discovery.
                 if media_type == "tv" and networks:
-                    network_ids = list({
-                        network.tmdb_network_id for network in networks
-                    })
-
                     network_results = _fetch_discovery(
                         tmdb=tmdb,
                         endpoint=endpoint,
@@ -1397,7 +1771,32 @@ def get_platform_home(
                 normalized.append(title)
 
             # Randomise the filtered candidate pool on each request.
-            random.shuffle(normalized)
+        
+            if slider.strategy == "top_picks":
+                normalized.sort(
+                    key=lambda item: _recommendation_score(
+                        item,
+                        preferred_genres,
+                    ),
+                    reverse=True,
+                )
+
+            elif slider.strategy in {
+                "newest",
+                "recent",
+                "latest",
+                "new_releases",
+            }:
+                normalized.sort(
+                    key=lambda item: item.get("release_date") or "",
+                    reverse=True,
+                )
+
+            else:
+                normalized.sort(
+                    key=lambda item: item.get("popularity", 0),
+                    reverse=True,
+                )
 
             home_sliders.append({
                 "key": slider.key,

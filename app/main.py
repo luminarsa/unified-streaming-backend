@@ -2,7 +2,9 @@
 from fastapi import FastAPI
 
 from app.core.config import settings
+from app.core.redis_client import check_redis_connection
 from app.api.v1.router import api_router
+
 
 app = FastAPI(
     title=settings.app_name,
@@ -10,15 +12,18 @@ app = FastAPI(
     version="1.0.0",
 )
 
+
 app.include_router(
     api_router,
     prefix=settings.api_v1_prefix,
 )
 
+
 for route in app.routes:
     if hasattr(route, "methods") and hasattr(route, "path"):
         if "home" in route.path or "platform" in route.path:
             print("REGISTERED ROUTE:", route.methods, route.path)
+
 
 @app.get("/")
 def home():
@@ -27,9 +32,29 @@ def home():
         "status": "success",
     }
 
+
 @app.get("/health")
 def health_check():
     return {
         "status": "healthy",
         "service": "streaming-platform-backend",
+    }
+
+
+@app.get("/health/redis")
+def redis_health_check():
+
+    connected = check_redis_connection()
+
+    if connected:
+        return {
+            "status": "connected",
+            "service": "redis",
+            "message": "Successfully connected to Redis."
+        }
+
+    return {
+        "status": "disconnected",
+        "service": "redis",
+        "message": "Could not connect to Redis."
     }

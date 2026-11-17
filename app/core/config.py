@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     tmdb_language: str = "en-US"
     tmdb_timeout_seconds: float = 40.0
 
+    # Redis
+    redis_url: str | None = None
+
     # PayPal
     paypal_environment: str = "sandbox"
     paypal_client_id: str = "BAAkOCt7bqHguWccAM0613fyP58PaxVMf9pp_nNS-Mlsc2B0gRGDtaal1WR9AVZOogv-1B3fPR4sKtCzM8"

@@ -5,9 +5,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.services.paypal import (
-    PayPalError
-)
 from app.services.paypal_webhook_events import (
     store_verified_webhook_event,
     process_webhook_event,

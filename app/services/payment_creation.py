@@ -11,13 +11,6 @@ from app.models.identity import Account
 from app.models.commercial import Plan, Subscription
 from app.models.payment_transaction import PaymentTransaction
 
-from app.services.paypal import (
-    create_invoice,
-    send_invoice,
-    get_invoice,
-    PayPalError,
-)
-
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +112,8 @@ def format_payment_response(
     }
 
 
+
+
 # =========================================================
 # 4. CREATE OR RESUME PAYPAL INVOICE
 # =========================================================
@@ -133,184 +128,138 @@ async def create_or_resume_invoice(
     """
     Creates a PayPal invoice if one does not already exist.
 
-    If an invoice already exists, retrieves and resumes that
-    same invoice rather than creating another one.
+    The checkout creation function is responsible only for:
+    1. Creating the PayPal invoice.
+    2. Extracting the PayPal invoice ID.
+    3. Saving the invoice ID in the database.
+    4. Returning the pending checkout response.
+
+    Invoice retrieval and payment verification belong
+    to the separate reconciliation engine.
     """
 
     # -----------------------------------------------------
-    # A. CREATE INVOICE ONLY IF NO INVOICE ID IS SAVED
+    # A. REUSE EXISTING INVOICE IF ONE IS ALREADY SAVED
     # -----------------------------------------------------
 
-    if not transaction.provider_invoice_id:
+    if transaction.provider_invoice_id:
 
-        try:
-            logger.info(
-                "LUMINA PAYPAL STAGE 1: Creating invoice. Transaction=%s",
-                transaction.id,
-            )
-
-            invoice_response = await create_invoice(
-                transaction_id=str(transaction.id),
-                customer_email=account.email,
-                plan_name=plan.name,
-                amount=str(transaction.amount),
-                currency=transaction.currency,
-                request_id=str(transaction.id),
-            )
-
-        except PayPalError as exc:
-            raise PaymentCreationError(
-                "PayPal invoice creation failed. "
-                "The existing checkout can be retried using "
-                "the same idempotency key. "
-                f"PayPal error: {str(exc)}"
-            ) from exc
-
-        invoice_id = extract_paypal_invoice_id(invoice_response)
-
-        if not invoice_id:
-            logger.error(
-                "PayPal invoice creation returned no extractable ID. "
-                "Response keys: %s",
-                list(invoice_response.keys())
-                if isinstance(invoice_response, dict)
-                else type(invoice_response).__name__,
-            )
-
-            raise PaymentCreationError(
-                "PayPal's invoice creation response did not contain "
-                "a recognizable invoice ID. Check the backend logs."
-            )
-
-        # Save the invoice ID before attempting to send it.
-        try:
-            transaction.provider_invoice_id = invoice_id
-            transaction.provider_invoice_status = (
-                invoice_response.get("status", "DRAFT")
-            )
-
-            db.add(transaction)
-            db.commit()
-            db.refresh(transaction)
-
-        except Exception as exc:
-            db.rollback()
-
-            raise PaymentCreationError(
-                "PayPal created the invoice, but Lumina could "
-                "not save its invoice ID. Retry the same "
-                "checkout using the same idempotency key."
-            ) from exc
-
-    # -----------------------------------------------------
-    # B. RETRIEVE THE EXISTING INVOICE FROM PAYPAL
-    # -----------------------------------------------------
-
-    invoice_id = transaction.provider_invoice_id
-
-    try:
         logger.info(
-            "LUMINA PAYPAL STAGE 2: Retrieving invoice. Invoice=%s",
-            invoice_id,
+            "LUMINA PAYPAL: Existing invoice found. "
+            "Transaction=%s Invoice=%s",
+            transaction.id,
+            transaction.provider_invoice_id,
         )
 
-        invoice_details = await get_invoice(invoice_id)
+        return format_payment_response(
+            subscription,
+            transaction,
+        )
+
+    # -----------------------------------------------------
+    # B. CREATE NEW PAYPAL INVOICE
+    # -----------------------------------------------------
+
+    try:
+
+        logger.info(
+            "LUMINA PAYPAL STAGE 1: Creating invoice. "
+            "Transaction=%s",
+            transaction.id,
+        )
+
+        invoice_response = await create_invoice(
+            transaction_id=str(transaction.id),
+            customer_email=account.email,
+            plan_name=plan.name,
+            amount=str(transaction.amount),
+            currency=transaction.currency,
+            request_id=str(transaction.id),
+        )
 
     except PayPalError as exc:
+
+        logger.exception(
+            "LUMINA PAYPAL: Invoice creation failed. "
+            "Transaction=%s",
+            transaction.id,
+        )
+
         raise PaymentCreationError(
-            "The existing PayPal invoice could not be retrieved. "
-            "Retry this checkout using the same idempotency key. "
+            "PayPal invoice creation failed. "
             f"PayPal error: {str(exc)}"
         ) from exc
 
-    invoice_status = invoice_details.get("status", "").upper()
-
-    if invoice_status in (
-        "CANCELLED",
-        "REFUNDED",
-        "MARKED_AS_REFUNDED",
-    ):
-        raise PaymentCreationError(
-            "This PayPal invoice is no longer payable. "
-            "A new checkout is required."
-        )
-
     # -----------------------------------------------------
-    # C. SEND ONLY INVOICES THAT ARE STILL DRAFTS
+    # C. EXTRACT AND VALIDATE INVOICE ID
     # -----------------------------------------------------
 
-    if invoice_status == "DRAFT":
-
-        try:
-            logger.info(
-                "LUMINA PAYPAL STAGE 3: Sending invoice. Invoice=%s",
-                invoice_id,
-            )
-
-            await send_invoice(invoice_id)
-
-            logger.info(
-                "LUMINA PAYPAL STAGE 4: Invoice send request completed."
-            )
-
-        except PayPalError as exc:
-            raise PaymentCreationError(
-                "The invoice exists but could not be sent. "
-                "Retry this checkout using the same idempotency key. "
-                f"PayPal error: {str(exc)}"
-            ) from exc
-
-        # Retrieve the invoice again after sending.
-        try:
-            invoice_details = await get_invoice(invoice_id)
-
-        except PayPalError as exc:
-            raise PaymentCreationError(
-                "The invoice was sent, but its latest status "
-                "could not be retrieved. Retry using the same "
-                "idempotency key."
-            ) from exc
-
-        invoice_status = invoice_details.get(
-            "status",
-            "SENT",
-        ).upper()
-
-    # -----------------------------------------------------
-    # D. SAVE LATEST INVOICE DETAILS
-    # -----------------------------------------------------
-
-    invoice_url = (
-        invoice_details
-        .get("detail", {})
-        .get("metadata", {})
-        .get("recipient_view_url")
+    invoice_id = extract_paypal_invoice_id(
+        invoice_response
     )
 
-    try:
-        transaction.provider_invoice_status = invoice_status
+    if not invoice_id:
 
-        if invoice_url:
-            transaction.provider_invoice_url = invoice_url
+        logger.error(
+            "LUMINA PAYPAL: No invoice ID returned. "
+            "Transaction=%s Response=%s",
+            transaction.id,
+            invoice_response,
+        )
+
+        raise PaymentCreationError(
+            "PayPal did not return a valid invoice ID."
+        )
+
+    logger.info(
+        "LUMINA PAYPAL STAGE 1 SUCCESS: "
+        "Invoice ID received. Transaction=%s Invoice=%s",
+        transaction.id,
+        invoice_id,
+    )
+
+    # -----------------------------------------------------
+    # D. SAVE INVOICE ID
+    # -----------------------------------------------------
+
+    try:
+
+        transaction.provider_invoice_id = invoice_id
+
+        transaction.provider_invoice_status = (
+            invoice_response.get("status", "CREATED")
+        )
 
         db.add(transaction)
         db.commit()
         db.refresh(transaction)
 
+        logger.info(
+            "LUMINA PAYPAL STAGE 2 SUCCESS: "
+            "Invoice ID saved. Transaction=%s Invoice=%s",
+            transaction.id,
+            invoice_id,
+        )
+
     except Exception as exc:
+
         db.rollback()
 
+        logger.exception(
+            "LUMINA PAYPAL: Failed to save invoice ID. "
+            "Transaction=%s Invoice=%s",
+            transaction.id,
+            invoice_id,
+        )
+
         raise PaymentCreationError(
-            "The latest PayPal invoice details could not "
-            "be saved. The existing invoice can be retrieved again."
+            "PayPal returned an invoice ID, but Lumina "
+            "could not save it in the database."
         ) from exc
 
-    if not transaction.provider_invoice_url:
-        raise PaymentCreationError(
-            "The PayPal invoice exists, but its hosted payment URL "
-            "was not returned. Retry this checkout using the same "
-            "idempotency key."
-        )
+    # -----------------------------------------------------
+    # E. RETURN PENDING CHECKOUT RESPONSE
+    # -----------------------------------------------------
 
     return format_payment_response(
         subscription,

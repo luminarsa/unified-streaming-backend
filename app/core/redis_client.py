@@ -1,12 +1,15 @@
 
+import logging
+
 import redis
 from redis.exceptions import RedisError
 
 from app.core.config import settings
 
 
-# Create a Redis connection only when REDIS_URL is configured.
-# The actual network connection happens when a command is executed.
+logger = logging.getLogger(__name__)
+
+
 redis_client = None
 
 if settings.redis_url:
@@ -20,33 +23,41 @@ if settings.redis_url:
 
 
 def get_redis_client():
-    """
-    Return the shared Redis client.
-
-    Raises an error if Redis has not been configured.
-    """
 
     if redis_client is None:
-        raise RuntimeError(
-            "Redis is not configured. Please set REDIS_URL."
-        )
+        raise RuntimeError("Redis is not configured.")
 
     return redis_client
 
 
-def check_redis_connection() -> bool:
-    """
-    Check whether Redis is reachable.
+def check_redis_connection():
 
-    Returns True when the connection works,
-    otherwise returns False.
-    """
+    if not settings.redis_url:
+        logger.error("REDIS_URL environment variable is missing.")
+        return {
+            "connected": False,
+            "reason": "REDIS_URL is missing from application settings."
+        }
 
     if redis_client is None:
-        return False
+        return {
+            "connected": False,
+            "reason": "Redis client was not initialized."
+        }
 
     try:
-        return redis_client.ping()
+        redis_client.ping()
 
-    except RedisError:
-        return False
+        return {
+            "connected": True,
+            "reason": "Redis PING successful."
+        }
+
+    except Exception as error:
+        logger.exception("Redis connection failed.")
+
+        return {
+            "connected": False,
+            "reason": str(error),
+            "error_type": type(error).__name__
+        }

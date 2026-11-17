@@ -24,6 +24,12 @@ from app.models.identity import Profile
 from app.models.telemetry import ViewingSession, WatchProgress
 from app.services.tmdb_client import TMDBClient
 import random
+import json
+import hashlib
+import logging
+from app.services.cache_service import get_cache, set_cache
+
+logger = logging.getLogger(__name__)
 
 IMAGE_BASE_URL = "https://image.tmdb.org/t/p"
 
@@ -374,6 +380,7 @@ def _recommendation_score(
 
 
 
+
 def _fetch_discovery(
     tmdb: TMDBClient,
     endpoint: str,
@@ -389,10 +396,15 @@ def _fetch_discovery(
     network_ids: list[int] | None = None,
     kids_mode: bool = False,
 ) -> list[dict]:
+
+    # ---------------------------------------------------------
+    # 1. Build the TMDB discovery parameters
+    # ---------------------------------------------------------
+
     params = {
         "watch_region": region_code,
         "with_watch_providers": "|".join(
-            str(value) for value in provider_ids
+            str(value) for value in sorted(set(provider_ids))
         ),
         "include_adult": "false",
         "include_video": "false",
@@ -402,7 +414,7 @@ def _fetch_discovery(
 
     if genre_ids:
         params["with_genres"] = "|".join(
-            str(value) for value in genre_ids
+            str(value) for value in sorted(set(genre_ids))
         )
 
     if kids_mode:
@@ -420,12 +432,12 @@ def _fetch_discovery(
 
     if company_ids:
         params["with_companies"] = "|".join(
-            str(value) for value in company_ids
+            str(value) for value in sorted(set(company_ids))
         )
 
     if network_ids and media_type == "tv":
         params["with_networks"] = "|".join(
-            str(value) for value in network_ids
+            str(value) for value in sorted(set(network_ids))
         )
 
     # Configuration cannot override provider, region, or adult filters.
@@ -433,26 +445,92 @@ def _fetch_discovery(
         if key in ALLOWED_OVERRIDES and value is not None:
             params[key] = value
 
-    # Build a larger pool than the number displayed in the slider.
-    # TMDB returns up to 20 discovery results per page.
+    # ---------------------------------------------------------
+    # 2. Determine how many TMDB pages we need
+    # ---------------------------------------------------------
+
     candidate_target = max(1, min(page_size, 40))
     pages_to_fetch = (candidate_target + 19) // 20
+
+    # ---------------------------------------------------------
+    # 3. Generate a unique cache key
+    # ---------------------------------------------------------
+
+    cache_identity = {
+        "endpoint": endpoint,
+        "media_type": media_type,
+        "params": params,
+        "candidate_target": candidate_target,
+        "pages_to_fetch": pages_to_fetch,
+        "kids_mode": kids_mode,
+    }
+
+    # Convert the query configuration into consistent JSON.
+    cache_identity_json = json.dumps(
+        cache_identity,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+    # Hash the configuration so our Redis keys remain short.
+    cache_hash = hashlib.sha256(
+        cache_identity_json.encode("utf-8")
+    ).hexdigest()
+
+    cache_key = f"tmdb:discovery:{cache_hash}"
+
+    # ---------------------------------------------------------
+    # 4. Check Redis before contacting TMDB
+    # ---------------------------------------------------------
+
+    cached_results = get_cache(cache_key)
+
+    if isinstance(cached_results, list):
+
+        logger.info(
+            "TMDB DISCOVERY | Using cached results | "
+            "media_type=%s | strategy=%s | results=%s",
+            media_type,
+            strategy,
+            len(cached_results),
+        )
+
+        return cached_results
+
+    # ---------------------------------------------------------
+    # 5. Cache miss: fetch the results from TMDB
+    # ---------------------------------------------------------
+
+    logger.info(
+        "TMDB DISCOVERY | Fetching from TMDB | "
+        "media_type=%s | strategy=%s | pages=%s",
+        media_type,
+        strategy,
+        pages_to_fetch,
+    )
 
     results_by_id = {}
 
     for page_number in range(1, pages_to_fetch + 1):
+
         page_params = {
             **params,
             "page": page_number,
         }
 
-        data = tmdb.get(endpoint, params=page_params)
+        data = tmdb.get(
+            endpoint,
+            params=page_params,
+        )
+
         page_results = data.get("results", [])
 
         if not page_results:
             break
 
         for item in page_results:
+
             item_id = item.get("id")
 
             if item_id is not None:
@@ -464,7 +542,35 @@ def _fetch_discovery(
         if page_number >= total_pages:
             break
 
-    return list(results_by_id.values())
+    results = list(results_by_id.values())
+
+    # ---------------------------------------------------------
+    # 6. Save the results in Redis for 30 minutes
+    # ---------------------------------------------------------
+
+    cache_saved = set_cache(
+        key=cache_key,
+        value=results,
+        ttl=1800,
+    )
+
+    if cache_saved:
+        logger.info(
+            "TMDB DISCOVERY | Results cached successfully | "
+            "media_type=%s | strategy=%s | results=%s",
+            media_type,
+            strategy,
+            len(results),
+        )
+    else:
+        logger.warning(
+            "TMDB DISCOVERY | Could not cache results | "
+            "media_type=%s | strategy=%s",
+            media_type,
+            strategy,
+        )
+
+    return results
 
 def _get_all_provider_ids(
     db: Session,

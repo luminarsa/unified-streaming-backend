@@ -16,6 +16,7 @@ from app.models.commercial import Plan, Subscription
 from app.models.payment_transaction import PaymentTransaction
 from app.db.session import get_db
 from app.utils.auth import decode_access_token
+from app.schemas.plans import PlanCreateRequest
 from app.services.subscriptions import (
     get_account_subscription,
     get_available_plan,
@@ -263,12 +264,21 @@ def get_lumina_platforms(
         for p in platforms
     ]
 
-@router.post("/plans", status_code=status.HTTP_201_CREATED)
+
+@router.post(
+    "/plans",
+    status_code=status.HTTP_201_CREATED,
+    response_model=dict,
+)
 def create_new_plan(
-    payload: dict,
+    payload: PlanCreateRequest,
     db: Session = Depends(get_db),
 ) -> dict:
-    plan = create_plan(db=db, payload=payload)
+
+    plan = create_plan(
+        db=db,
+        payload=payload,
+    )
 
     return {
         "success": True,

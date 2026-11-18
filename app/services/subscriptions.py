@@ -6,6 +6,17 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from decimal import Decimal
+
+from fastapi import HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.models.commercial import Plan, PlanEntitlement
+from app.models.platform_config import StreamingPlatform
+from app.schemas.plans import PlanCreateRequest
+
 
 from app.models.commercial import (
     Plan,
@@ -78,6 +89,7 @@ def _plan_data(db: Session, plan: Plan) -> dict:
             {
                 "id": platform.id,
                 "name": platform.name,
+                "logo": platform.logo_url,
                 "slug": platform.slug,
                 "supports_movies": platform.supports_movies,
                 "supports_tv_shows": platform.supports_tv_shows,
@@ -382,142 +394,105 @@ def get_account_entitlements(
     }
 
 
-def create_plan(db: Session, payload: dict) -> dict:
+def create_plan(db: Session, payload: PlanCreateRequest) -> dict:
     """
-    Create a plan, its platform entitlements, and its features
+    Create a plan and its platform entitlements
     in one database transaction.
+
+    If entitlements is empty, all active platforms
+    will automatically be included.
     """
 
-    # 1. Validate required fields
-    code = str(payload.get("code", "")).strip().upper()
-    name = str(payload.get("name", "")).strip()
+    # -----------------------------------------
+    # 1. CHECK IF PLAN CODE ALREADY EXISTS
+    # -----------------------------------------
 
-    if not code or not name:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Both code and name are required.",
-        )
-
-    # 2. Validate price
-    try:
-        price_minor = int(payload["price_minor"])
-        if price_minor < 0:
-            raise ValueError
-    except (KeyError, TypeError, ValueError):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="price_minor must be a non-negative integer in cents.",
-        )
-
-    # Prevent decimal values such as 9900.50 being silently accepted.
-    if isinstance(payload["price_minor"], bool):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="price_minor must be an integer.",
-        )
-
-    if isinstance(payload["price_minor"], float) and not payload["price_minor"].is_integer():
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="price_minor must be an integer.",
-        )
-
-    # 3. Validate simultaneous streams
-    try:
-        max_streams = int(payload.get("max_simultaneous_streams", 1))
-        if max_streams < 1:
-            raise ValueError
-    except (TypeError, ValueError):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="max_simultaneous_streams must be at least 1.",
-        )
-
-    # 4. Validate included platforms and features
-    platform_slugs = payload.get("platforms", [])
-    features = payload.get("features", {})
-
-    if not isinstance(platform_slugs, list):
-        raise HTTPException(
-            status_code=422,
-            detail="platforms must be a list of platform slugs.",
-        )
-
-    if len(platform_slugs) != len(set(platform_slugs)):
-        raise HTTPException(
-            status_code=422,
-            detail="Duplicate platform slugs are not allowed.",
-        )
-
-    if not isinstance(features, dict):
-        raise HTTPException(
-            status_code=422,
-            detail="features must be an object of feature codes and boolean values.",
-        )
-
-    if any(
-        not isinstance(key, str)
-        or not key.strip()
-        or not isinstance(value, bool)
-        for key, value in features.items()
-    ):
-        raise HTTPException(
-            status_code=422,
-            detail="Each feature must have a non-empty code and a boolean value.",
-        )
-
-    # 5. Check whether the plan code already exists
     existing_plan = db.scalar(
-        select(Plan).where(Plan.code == code)
+        select(Plan).where(
+            Plan.code == payload.code
+        )
     )
 
     if existing_plan:
         raise HTTPException(
-            status_code=409,
-            detail=f"A plan with code '{code}' already exists.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A plan with code '{payload.code}' already exists.",
         )
 
-    # 6. Resolve platform slugs to actual platform records
-    platforms = []
+    # -----------------------------------------
+    # 2. RESOLVE PLATFORM ENTITLEMENTS
+    # -----------------------------------------
 
-    if platform_slugs:
+    if payload.entitlements:
+
+        # Only include the platforms specified by the frontend.
         platforms = list(
             db.scalars(
                 select(StreamingPlatform).where(
-                    StreamingPlatform.slug.in_(platform_slugs),
+                    StreamingPlatform.id.in_(payload.entitlements),
                     StreamingPlatform.is_active.is_(True),
                 )
             ).all()
         )
 
-    found_slugs = {platform.slug for platform in platforms}
-    missing_slugs = set(platform_slugs) - found_slugs
+        found_ids = {
+            platform.id for platform in platforms
+        }
 
-    if missing_slugs:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": "Some platforms do not exist or are inactive.",
-                "platforms": sorted(missing_slugs),
-            },
+        missing_ids = set(payload.entitlements) - found_ids
+
+        if missing_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": "Some platform IDs do not exist or are inactive.",
+                    "platform_ids": [
+                        str(platform_id)
+                        for platform_id in missing_ids
+                    ],
+                },
+            )
+
+    else:
+
+        # Empty entitlements means include ALL active platforms.
+        platforms = list(
+            db.scalars(
+                select(StreamingPlatform).where(
+                    StreamingPlatform.is_active.is_(True)
+                )
+            ).all()
         )
 
-    # 7. Create the plan and all related records atomically
+    # -----------------------------------------
+    # 3. CREATE PLAN AND ENTITLEMENTS
+    # -----------------------------------------
+
     try:
+
         plan = Plan(
-            code=code,
-            name=name,
-            price_minor=price_minor,
-            currency="ZAR",
-            billing_interval=payload.get("billing_interval", "Monthly"),
-            max_simultaneous_streams=max_streams,
-            is_active=payload.get("is_active", True),
+            category=payload.category,
+            code=payload.code,
+            name=payload.name,
+
+            price_minor=payload.price_minor,
+            currency=payload.currency,
+
+            paypal_price=payload.paypal_price,
+            paypal_currency=payload.paypal_currency,
+
+            billing_interval=payload.billing_interval,
+            max_simultaneous_streams=payload.max_simultaneous_streams,
+
+            is_active=payload.is_active,
         )
 
         db.add(plan)
-        db.flush()  # Generates the plan UUID before adding related rows.
+        db.flush()
 
+        # Create platform entitlement records.
         for platform in platforms:
+
             db.add(
                 PlanEntitlement(
                     plan_id=plan.id,
@@ -525,52 +500,63 @@ def create_plan(db: Session, payload: dict) -> dict:
                 )
             )
 
-        for feature_code, is_enabled in features.items():
-            db.add(
-                PlanFeature(
-                    plan_id=plan.id,
-                    feature_code=feature_code.strip().lower(),
-                    is_enabled=is_enabled,
-                )
-            )
-
+        # Commit everything together.
         db.commit()
         db.refresh(plan)
 
+        # -----------------------------------------
+        # 4. RETURN CREATED PLAN
+        # -----------------------------------------
+
         return {
-            "id": str(plan.id),
+            "id": plan.id,
+
+            "category": plan.category,
             "code": plan.code,
             "name": plan.name,
+
             "price_minor": int(plan.price_minor),
-            "price_zar": f"R{Decimal(str(plan.price_minor)) / Decimal('100'):.2f}",
+
+            "price_zar": (
+                f"R{Decimal(str(plan.price_minor)) / Decimal('100'):.2f}"
+            ),
+
             "currency": plan.currency,
+
+            "paypal_price": plan.paypal_price,
+            "paypal_currency": plan.paypal_currency,
+
             "billing_interval": plan.billing_interval,
             "max_simultaneous_streams": plan.max_simultaneous_streams,
+
             "is_active": plan.is_active,
-            "platforms": [
+
+            "entitlements": [
                 {
-                    "id": str(platform.id),
+                    "id": platform.id,
                     "name": platform.name,
                     "slug": platform.slug,
                 }
                 for platform in platforms
             ],
-            "features": features,
-            "created_at": plan.created_at.isoformat()
-            if plan.created_at
-            else None,
+
+            "created_at": plan.created_at,
         }
 
     except IntegrityError as exc:
+
         db.rollback()
+
         raise HTTPException(
-            status_code=409,
+            status_code=status.HTTP_409_CONFLICT,
             detail="The plan could not be created because of a database constraint.",
         ) from exc
 
     except Exception:
+
         db.rollback()
         raise
+
 
 def admin_assign_plan_to_account(
     db: Session,

@@ -395,6 +395,8 @@ def _fetch_discovery(
     company_ids: list[int] | None = None,
     network_ids: list[int] | None = None,
     kids_mode: bool = False,
+    force_refresh: bool = False,
+    cache_status: dict | None = None,
 ) -> list[dict]:
 
     # ---------------------------------------------------------
@@ -484,19 +486,25 @@ def _fetch_discovery(
     # 4. Check Redis before contacting TMDB
     # ---------------------------------------------------------
 
-    cached_results = get_cache(cache_key)
+    if not force_refresh:
+        cached_results = get_cache(cache_key)
 
-    if isinstance(cached_results, list):
-
+        if isinstance(cached_results, list):
+            logger.info(
+                "TMDB DISCOVERY | Using cached results | "
+                "media_type=%s | strategy=%s | results=%s",
+                media_type,
+                strategy,
+                len(cached_results),
+            )
+            return cached_results
+    else:
         logger.info(
-            "TMDB DISCOVERY | Using cached results | "
-            "media_type=%s | strategy=%s | results=%s",
+            "TMDB DISCOVERY | Force refresh requested | "
+            "media_type=%s | strategy=%s",
             media_type,
             strategy,
-            len(cached_results),
         )
-
-        return cached_results
 
     # ---------------------------------------------------------
     # 5. Cache miss: fetch the results from TMDB
@@ -544,6 +552,7 @@ def _fetch_discovery(
 
     results = list(results_by_id.values())
 
+
     # ---------------------------------------------------------
     # 6. Save the results in Redis for 30 minutes
     # ---------------------------------------------------------
@@ -553,6 +562,13 @@ def _fetch_discovery(
         value=results,
         ttl=1800,
     )
+
+    # Allow the scheduled cache refresh service to inspect
+    # whether Redis successfully saved this discovery query.
+    if cache_status is not None:
+        cache_status["saved"] = cache_saved
+        cache_status["cache_key"] = cache_key
+        cache_status["result_count"] = len(results)
 
     if cache_saved:
         logger.info(
@@ -571,6 +587,7 @@ def _fetch_discovery(
         )
 
     return results
+
 
 def _get_all_provider_ids(
     db: Session,

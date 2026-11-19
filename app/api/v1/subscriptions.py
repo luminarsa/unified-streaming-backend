@@ -223,12 +223,14 @@ async def create_subscription_checkout(
             "invoice_status": paypal_result["invoice_status"],
         }
 
-    except ValueError:
+    except ValueError as exc:
         db.rollback()
+
+        print("CHECKOUT VALUE ERROR:", repr(exc))
 
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="A valid account ID or plan ID is required.",
+            detail=str(exc),
         )
 
     except HTTPException:

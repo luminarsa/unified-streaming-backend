@@ -4,8 +4,26 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.schemas.auth import RegisterRequest, LoginRequest, SelectProfileRequest
-from app.services.auth import register_account, login_account, select_profile
+
+from app.schemas.auth import (
+    RegisterRequest,
+    VerifyRegistrationRequest,
+    ResendVerificationRequest,
+    RegistrationResponse,
+    RegistrationVerificationResponse,
+    ResendVerificationResponse,
+    LoginRequest,
+    SelectProfileRequest,
+)
+
+from app.services.auth import (
+    register_account,
+    verify_registration_code,
+    resend_registration_code,
+    login_account,
+    select_profile,
+)
+
 
 bearer_scheme = HTTPBearer()
 
@@ -14,33 +32,74 @@ router = APIRouter(
     tags=["Authentication"],
 )
 
-@router.post("/register", status_code=201)
+
+# =================================================
+# REGISTER ACCOUNT
+# =================================================
+
+@router.post(
+    "/register",
+    status_code=201,
+    response_model=RegistrationResponse,
+)
 def register(
     request: RegisterRequest,
     db: Session = Depends(get_db),
 ):
-    result = register_account(
+    return register_account(
         db=db,
-        email=str(request.email),
+        email=request.email,
         password=request.password,
+        phone_number=request.phone_number,
         profile_name=request.primary_profile.name,
-        avatar_key=request.primary_profile.avatar_key,
+        avatar_key=request.primary_profile.avatar_url,
+        is_kids_profile=request.primary_profile.is_kids_profile,
+        referral_code=request.referral_code,
     )
 
-    return {
-        "message": result["message"],
-        "account": {
-            "id": str(result["account"].id),
-            "email": result["account"].email,
-            "status": result["account"].status,
-        },
-        "primary_profile": {
-            "id": str(result["primary_profile"].id),
-            "name": result["primary_profile"].name,
-            "avatar_key": result["primary_profile"].avatar_key,
-        },
-    }
 
+# =================================================
+# VERIFY REGISTRATION EMAIL
+# =================================================
+
+@router.post(
+    "/verify-registration",
+    status_code=200,
+    response_model=RegistrationVerificationResponse,
+)
+def verify_registration(
+    request: VerifyRegistrationRequest,
+    db: Session = Depends(get_db),
+):
+    return verify_registration_code(
+        db=db,
+        email=request.email,
+        verification_code=request.verification_code,
+    )
+
+
+# =================================================
+# RESEND VERIFICATION EMAIL
+# =================================================
+
+@router.post(
+    "/resend-verification",
+    status_code=200,
+    response_model=ResendVerificationResponse,
+)
+def resend_verification(
+    request: ResendVerificationRequest,
+    db: Session = Depends(get_db),
+):
+    return resend_registration_code(
+        db=db,
+        email=request.email,
+    )
+
+
+# =================================================
+# LOGIN
+# =================================================
 
 @router.post("/login")
 def login(
@@ -49,9 +108,14 @@ def login(
 ):
     return login_account(
         db=db,
-        email=str(request.email),
+        email=request.email,
         password=request.password,
     )
+
+
+# =================================================
+# SELECT PROFILE
+# =================================================
 
 @router.post("/select-profile")
 def select_profile_endpoint(

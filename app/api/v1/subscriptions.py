@@ -259,6 +259,7 @@ def get_lumina_platforms(
         {
             "id": p.id,
             "name": p.name,
+            "display_order": p.display_order,
             "logo": p.logo_url
         }
         for p in platforms

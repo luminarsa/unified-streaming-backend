@@ -102,7 +102,6 @@ def decode_access_token(db: Session, raw_token: str) -> dict:
             detail={"code": "INVALID_TOKEN"},
         )
 
-    # 1. Validate the JWT signature and claims.
     try:
         payload = jwt.decode(
             raw_token,
@@ -110,10 +109,10 @@ def decode_access_token(db: Session, raw_token: str) -> dict:
             algorithms=[JWT_ALGORITHM],
         )
 
-        account_id = str(payload["account_id"])
+        account_id = UUID(str(payload["account_id"]))
 
         profile_id = (
-            str(payload["profile_id"])
+            UUID(str(payload["profile_id"]))
             if payload.get("profile_id")
             else None
         )
@@ -124,7 +123,22 @@ def decode_access_token(db: Session, raw_token: str) -> dict:
             detail={"code": "JWT_DECODE_FAILED"},
         )
 
-    # 6. Check account status.
+    # Check that the session exists and is still valid.
+    session = db.scalar(
+        select(AuthSession).where(
+            AuthSession.token_hash == hash_token(raw_token),
+            AuthSession.revoked_at.is_(None),
+            AuthSession.expires_at > now_utc(),
+        )
+    )
+
+    if session is None:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "SESSION_INVALID_OR_EXPIRED"},
+        )
+
+    # Check account status.
     account = db.scalar(
         select(Account).where(Account.id == account_id)
     )
@@ -135,7 +149,21 @@ def decode_access_token(db: Session, raw_token: str) -> dict:
             detail={"code": "ACCOUNT_INACTIVE"},
         )
 
+    if session.account_id != account_id:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "ACCOUNT_SESSION_MISMATCH"},
+        )
+
+    # Validate the selected profile, if present.
+    if profile_id is not None:
+        if session.active_profile_id != profile_id:
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "PROFILE_SESSION_MISMATCH"},
+            )
+
     return {
-        "account_id": account_id,
-        "profile_id": profile_id,
+        "account_id": str(account_id),
+        "profile_id": str(profile_id) if profile_id else None,
     }

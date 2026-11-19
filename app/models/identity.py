@@ -16,20 +16,50 @@ from sqlalchemy.orm import relationship
 from app.db.base import Base
 
 
+
 class Account(Base):
     __tablename__ = "accounts"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    email = Column(String(320), unique=True, index=True, nullable=False)
+
+    email = Column(
+        String(320),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+
     password_hash = Column(Text, nullable=False)
-    status = Column(String(20), default="active", nullable=False)
+
+    # International phone number, e.g. +27821234567.
+    # Temporarily nullable to support existing accounts.
+    phone_number = Column(String(20), nullable=True)
+
+    status = Column(
+        String(20),
+        default="active",
+        nullable=False,
+    )
+
+    # Email verification status.
+    email_verified = Column(
+        Boolean,
+        default=False,
+        server_default="false",
+        nullable=False,
+    )
+
     email_verified_at = Column(DateTime(timezone=True))
+
+    # Referral code supplied during registration.
+    referral_code_used = Column(String(15))
 
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
     )
+
     updated_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -49,6 +79,13 @@ class Account(Base):
         cascade="all, delete-orphan",
     )
 
+    email_verifications = relationship(
+        "EmailVerification",
+        back_populates="account",
+        cascade="all, delete-orphan",
+    )
+
+
 class Profile(Base):
     __tablename__ = "profiles"
 
@@ -62,15 +99,28 @@ class Profile(Base):
     )
 
     name = Column(String(60), nullable=False)
-    avatar_key = Column(String(120))
-    is_kids_profile = Column(Boolean, default=False, nullable=False)
-    preferences = Column(JSONB, default=dict, nullable=False)
+
+    # Stores the avatar URL or avatar reference.
+    avatar_key = Column(String(500))
+
+    is_kids_profile = Column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+
+    preferences = Column(
+        JSONB,
+        default=dict,
+        nullable=False,
+    )
 
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
     )
+
     updated_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -78,7 +128,10 @@ class Profile(Base):
         nullable=False,
     )
 
-    account = relationship("Account", back_populates="profiles")
+    account = relationship(
+        "Account",
+        back_populates="profiles",
+    )
 
 class Avatar(Base):
     __tablename__ = "avatars"

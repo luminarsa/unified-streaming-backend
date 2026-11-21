@@ -285,3 +285,315 @@ class PlatformLiveChannel(Base):
             name="check_channel_number_positive",
         ),
     )
+
+
+# =========================================================
+# SLIDER-LEVEL CONTENT CONFIGURATION
+# These tables configure administrator-defined seed sliders.
+# They do not store dynamically generated profile sliders.
+# =========================================================
+
+
+class SliderCuratedTitle(Base):
+    """
+    Stores manually selected TMDB titles for a slider.
+
+    Priority determines the order in which curated titles
+    should be considered by the discovery engine.
+    """
+
+    __tablename__ = "slider_curated_titles"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    slider_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("slider_definitions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    tmdb_id = Column(Integer, nullable=False)
+    media_type = Column(String(10), nullable=False)
+
+    title = Column(String(255), nullable=False)
+
+    priority = Column(Integer, default=1, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "slider_id",
+            "tmdb_id",
+            "media_type",
+            name="uq_slider_curated_title",
+        ),
+        CheckConstraint(
+            "tmdb_id > 0",
+            name="check_slider_curated_tmdb_id_positive",
+        ),
+        CheckConstraint(
+            "media_type IN ('movie', 'tv')",
+            name="check_slider_curated_media_type",
+        ),
+        CheckConstraint(
+            "priority > 0",
+            name="check_slider_curated_priority_positive",
+        ),
+    )
+
+
+class SliderKeyword(Base):
+    """
+    Stores TMDB keywords associated with an individual slider.
+
+    match_type:
+        include = keyword is a discovery target.
+        boost = keyword should increase relevance when present.
+    """
+
+    __tablename__ = "slider_keywords"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    slider_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("slider_definitions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    tmdb_keyword_id = Column(Integer, nullable=False)
+    keyword_name = Column(String(150), nullable=False)
+
+    match_type = Column(String(20), default="include", nullable=False)
+
+    priority = Column(Integer, default=1, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "slider_id",
+            "tmdb_keyword_id",
+            name="uq_slider_keyword",
+        ),
+        CheckConstraint(
+            "tmdb_keyword_id > 0",
+            name="check_slider_keyword_id_positive",
+        ),
+        CheckConstraint(
+            "match_type IN ('include', 'boost')",
+            name="check_slider_keyword_match_type",
+        ),
+        CheckConstraint(
+            "priority > 0",
+            name="check_slider_keyword_priority_positive",
+        ),
+    )
+
+
+class SliderCollection(Base):
+    """
+    Associates TMDB collections with individual sliders.
+
+    Useful for franchise-based and universe-based sliders.
+    """
+
+    __tablename__ = "slider_collections"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    slider_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("slider_definitions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    tmdb_collection_id = Column(Integer, nullable=False)
+    collection_name = Column(String(255), nullable=False)
+
+    priority = Column(Integer, default=1, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "slider_id",
+            "tmdb_collection_id",
+            name="uq_slider_collection",
+        ),
+        CheckConstraint(
+            "tmdb_collection_id > 0",
+            name="check_slider_collection_id_positive",
+        ),
+        CheckConstraint(
+            "priority > 0",
+            name="check_slider_collection_priority_positive",
+        ),
+    )
+
+
+class SliderCompany(Base):
+    """
+    Stores production-company associations for an individual slider.
+
+    These mappings help discover relevant content.
+    They do not establish streaming availability.
+    """
+
+    __tablename__ = "slider_companies"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    slider_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("slider_definitions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    tmdb_company_id = Column(Integer, nullable=False)
+    company_name = Column(String(255), nullable=False)
+
+    relation_type = Column(
+        String(40),
+        default="produced_by",
+        nullable=False,
+    )
+
+    priority = Column(Integer, default=1, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "slider_id",
+            "tmdb_company_id",
+            "relation_type",
+            name="uq_slider_company_relation",
+        ),
+        CheckConstraint(
+            "tmdb_company_id > 0",
+            name="check_slider_company_id_positive",
+        ),
+        CheckConstraint(
+            "priority > 0",
+            name="check_slider_company_priority_positive",
+        ),
+    )
+
+
+class SliderNetwork(Base):
+    """
+    Stores TV network associations for an individual slider.
+
+    These mappings are discovery signals, not proof of
+    regional streaming availability.
+    """
+
+    __tablename__ = "slider_networks"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    slider_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("slider_definitions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    tmdb_network_id = Column(Integer, nullable=False)
+    network_name = Column(String(255), nullable=False)
+
+    priority = Column(Integer, default=1, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "slider_id",
+            "tmdb_network_id",
+            name="uq_slider_network",
+        ),
+        CheckConstraint(
+            "tmdb_network_id > 0",
+            name="check_slider_network_id_positive",
+        ),
+        CheckConstraint(
+            "priority > 0",
+            name="check_slider_network_priority_positive",
+        ),
+    )
+
+
+class SliderExcludedTitle(Base):
+    """
+    Stores titles that must be excluded from an individual slider.
+
+    This allows administrators to prevent irrelevant or
+    unwanted titles from appearing in a generated collection.
+    """
+
+    __tablename__ = "slider_excluded_titles"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    slider_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("slider_definitions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    tmdb_id = Column(Integer, nullable=False)
+    media_type = Column(String(10), nullable=False)
+
+    title = Column(String(255), nullable=False)
+    reason = Column(Text, nullable=True)
+
+    enabled = Column(Boolean, default=True, nullable=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "slider_id",
+            "tmdb_id",
+            "media_type",
+            name="uq_slider_excluded_title",
+        ),
+        CheckConstraint(
+            "tmdb_id > 0",
+            name="check_slider_excluded_tmdb_id_positive",
+        ),
+        CheckConstraint(
+            "media_type IN ('movie', 'tv')",
+            name="check_slider_excluded_media_type",
+        ),
+    )

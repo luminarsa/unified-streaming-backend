@@ -11,12 +11,13 @@ from app.api.v1.recommendations import router as recommendations_router
 from app.api.v1.payments import router as payments_router
 from app.api.v1.paypal_webhooks import router as paypal_webhooks_router
 from app.api.v1.cache_refresh import router as cache_refresh_router
-
+from app.api.v1.slider_configuration import router as slider_configuration_router
 
 api_router = APIRouter()
 
 api_router.include_router(platform_content_router)
 api_router.include_router(platforms_administration_router)
+api_router.include_router(slider_configuration_router)
 api_router.include_router(auth_router)
 api_router.include_router(account_router)
 api_router.include_router(telemetry_router)

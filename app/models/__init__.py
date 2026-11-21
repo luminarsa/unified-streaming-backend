@@ -17,6 +17,14 @@ from app.models.platform_config import (
     PlatformNavigationItem,
     PlatformLiveChannel,
 )
+from app.models.platform_config import (
+    SliderCuratedTitle,
+    SliderKeyword,
+    SliderCollection,
+    SliderCompany,
+    SliderNetwork,
+    SliderExcludedTitle,
+)
 
 from app.models.telemetry import (
     WatchList,

@@ -174,6 +174,88 @@ class PlatformNetwork(Base):
         ),
     )
 
+class PlatformOriginalSource(Base):
+    """
+    Platform-level configuration for identifying curated platform originals.
+
+    source_type:
+        production_company = TMDB production company
+        network = TMDB TV network
+        keyword = TMDB keyword
+        curated_title = individually selected movie or TV show
+    """
+
+    __tablename__ = "platform_original_sources"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    platform_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("streaming_platforms.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    source_type = Column(String(30), nullable=False)
+
+    # TMDB company, network, keyword, movie or TV show ID.
+    tmdb_id = Column(Integer, nullable=False)
+
+    # Human-readable company, network, keyword or title name.
+    name = Column(String(255), nullable=False)
+
+    # Only used for curated_title: movie or tv.
+    media_type = Column(String(20), nullable=True)
+
+    # Allows a source to be retained but temporarily excluded from results.
+    include_in_discovery = Column(
+        Boolean,
+        default=True,
+        server_default="true",
+        nullable=False,
+    )
+
+    # Useful for tracking how confidently an original source was verified.
+    confidence = Column(
+        String(20),
+        default="verified",
+        server_default="verified",
+        nullable=False,
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "source_type IN "
+            "('production_company', 'network', 'keyword', 'curated_title')",
+            name="ck_platform_original_source_type",
+        ),
+        CheckConstraint(
+            "(source_type = 'curated_title' AND media_type IN ('movie', 'tv')) "
+            "OR (source_type != 'curated_title' AND media_type IS NULL)",
+            name="ck_platform_original_media_type",
+        ),
+        UniqueConstraint(
+            "platform_id",
+            "source_type",
+            "tmdb_id",
+            "media_type",
+            name="uq_platform_original_source",
+        ),
+    )
+
 
 class SliderDefinition(Base):
     __tablename__ = "slider_definitions"

@@ -37,6 +37,21 @@ IMAGE_BASE_URL = "https://image.tmdb.org/t/p"
 
 KIDS_DISCOVERY_GENRE_IDS = {16, 10751}
 
+PROTECTED_QUERY_PARAMETERS = {
+    "page",
+    "include_adult",
+    "language",
+    "region",
+    "watch_region",
+    "with_watch_providers",
+    "with_watch_monetization_types",
+    # Internal franchise-expansion settings; not TMDB discover parameters.
+    "expand_curated_titles",
+    "related_content_sources",
+    "related_titles_per_seed",
+    "related_min_genre_match",
+}
+
 
 class PlatformHomeService:
 
@@ -158,27 +173,6 @@ class PlatformHomeService:
         )
 
     # ==================================================
-    # CLEAN IDS
-    # ==================================================
-
-    def _clean_ids(self, values) -> list[int]:
-
-        result = []
-
-        for value in values or []:
-
-            try:
-                value = int(value)
-
-                if value > 0 and value not in result:
-                    result.append(value)
-
-            except (TypeError, ValueError):
-                continue
-
-        return result
-
-    # ==================================================
     # PROFILE FILTERING
     # ==================================================
 
@@ -283,29 +277,78 @@ class PlatformHomeService:
         }
 
     # ==================================================
-    # SLIDER GOAL
+    # CLEAN IDS
+    # ==================================================
+
+    def _clean_ids(self, values) -> list[int]:
+
+        result = []
+
+        for value in values:
+
+            try:
+                value = int(value)
+
+                if value > 0 and value not in result:
+                    result.append(value)
+
+            except (TypeError, ValueError):
+                continue
+
+        return result
+
+    # ==================================================
+    # SLIDER GOAL CLASSIFICATION
     # ==================================================
 
     def _get_slider_goal(self, strategy: str) -> str:
 
         strategy = (strategy or "").strip().lower()
 
-        if "trending" in strategy:
+        if strategy in {
+            "trending",
+            "provider_trending",
+            "company_trending",
+            "network_trending",
+        }:
             return "trending"
 
-        if "top_rated" in strategy or "highest_rated" in strategy:
+        if strategy in {
+            "top_rated",
+            "highest_rated",
+        }:
             return "top_rated"
 
-        if "recent" in strategy or "latest" in strategy:
+        if strategy in {
+            "provider_recent",
+            "company_recent",
+            "network_recent",
+            "recent",
+            "latest",
+            "newest",
+            "new_releases",
+        }:
             return "recent"
 
-        if "genre" in strategy:
+        if strategy in {
+            "top_picks",
+            "personalized",
+            "personalised",
+        }:
+            return "personalized"
+
+        if strategy in {
+            "provider_genre",
+            "company_genre",
+            "network_genre",
+            "genre",
+        }:
             return "genre"
 
         return "popular"
 
     # ==================================================
-    # DISCOVERY SORT ORDER
+    # GET TMDB DISCOVERY SORT ORDER
     # ==================================================
 
     def _get_sort_order(
@@ -316,17 +359,44 @@ class PlatformHomeService:
 
         goal = self._get_slider_goal(strategy)
 
-        # Popularity is the default for homepage discovery.
-        if goal in {"popular", "genre", "recent"}:
-            return "popularity.desc"
+        if goal == "recent":
+
+            return (
+                "primary_release_date.desc"
+                if media_type == "movie"
+                else "first_air_date.desc"
+            )
 
         if goal == "top_rated":
             return "vote_average.desc"
 
-        if goal == "trending":
-            return "popularity.desc"
-
         return "popularity.desc"
+
+    # ==================================================
+    # APPLY SAFE QUERY OVERRIDES
+    # ==================================================
+
+    def _apply_overrides(
+        self,
+        params: dict,
+        overrides: dict,
+    ) -> None:
+
+        for key, value in (overrides or {}).items():
+
+            if key in PROTECTED_QUERY_PARAMETERS:
+                continue
+
+            if value is None:
+                continue
+
+            if isinstance(value, (str, int, float, bool)):
+                params[key] = value
+
+            elif isinstance(value, list):
+                params[key] = "|".join(
+                    str(item) for item in value
+                )
 
     # ==================================================
     # CHECK ACTUAL SUBSCRIPTION AVAILABILITY
@@ -386,33 +456,6 @@ class PlatformHomeService:
             return False
 
     # ==================================================
-    # FETCH CURATED TITLE DETAILS
-    # ==================================================
-
-    async def _get_curated_title(
-        self,
-        tmdb_id: int,
-        media_type: str,
-        language: str,
-    ) -> dict | None:
-
-        try:
-            return await self.tmdb.content_details(
-                media_type,
-                tmdb_id,
-            )
-
-        except Exception as exc:
-
-            logger.warning(
-                "Curated title lookup failed: title=%s error=%s",
-                tmdb_id,
-                str(exc),
-            )
-
-            return None
-
-    # ==================================================
     # FETCH COLLECTION CONTENT
     # ==================================================
 
@@ -441,19 +484,58 @@ class PlatformHomeService:
             return []
 
     # ==================================================
-    # FETCH TMDB RECOMMENDATIONS
+    # FETCH CURATED TITLE
     # ==================================================
 
-    async def _get_recommendations(
+    async def _get_curated_title(
         self,
         tmdb_id: int,
         media_type: str,
         language: str,
+    ) -> dict | None:
+
+        try:
+            return await self.tmdb.content_details(
+                media_type,
+                tmdb_id,
+            )
+
+        except Exception as exc:
+
+            logger.warning(
+                "Curated title lookup failed: title=%s error=%s",
+                tmdb_id,
+                str(exc),
+            )
+
+            return None
+
+
+    # ==================================================
+    # FETCH RELATED TITLES FOR A FRANCHISE SEED
+    # ==================================================
+
+    async def _get_related_titles(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        source: str,
+        language: str,
     ) -> list[dict]:
+        """
+        Fetch TMDB recommendations or similar titles for a seed title.
+
+        Supported sources:
+        - recommendations
+        - similar
+        """
+
+        if source not in {"recommendations", "similar"}:
+            return []
 
         try:
             payload = await self.tmdb.get(
-                f"/{media_type}/{tmdb_id}/recommendations",
+                f"/{media_type}/{tmdb_id}/{source}",
                 params={
                     "language": language,
                     "page": 1,
@@ -465,99 +547,22 @@ class PlatformHomeService:
         except Exception as exc:
 
             logger.warning(
-                "TMDB recommendations failed: title=%s error=%s",
+                "Franchise expansion failed: seed=%s "
+                "media_type=%s source=%s error=%s",
                 tmdb_id,
+                media_type,
+                source,
                 str(exc),
             )
 
             return []
 
-    # ==================================================
-    # FETCH RELATED CONTENT FROM CURATED SEEDS
-    # ==================================================
-
-    async def _get_franchise_candidates(
-        self,
-        curated_titles: list,
-        media_types: list[str],
-        language: str,
-        profile: Profile,
-    ) -> list[dict]:
-
-        tasks = []
-
-        for curated in curated_titles:
-
-            if curated.media_type not in media_types:
-                continue
-
-            tasks.append({
-                "media_type": curated.media_type,
-                "seed_id": curated.tmdb_id,
-                "task": self._get_recommendations(
-                    tmdb_id=curated.tmdb_id,
-                    media_type=curated.media_type,
-                    language=language,
-                ),
-            })
-
-        responses = await asyncio.gather(
-            *[item["task"] for item in tasks],
-            return_exceptions=True,
-        )
-
-        candidates = {}
-
-        for task_info, payload in zip(tasks, responses):
-
-            if isinstance(payload, Exception) or not payload:
-                continue
-
-            for item in payload:
-
-                tmdb_id = item.get("id")
-
-                if not tmdb_id:
-                    continue
-
-                if not self._allowed_for_profile(item, profile):
-                    continue
-
-                key = (
-                    int(tmdb_id),
-                    task_info["media_type"],
-                )
-
-                if key not in candidates:
-                    candidates[key] = {
-                        "item": item,
-                        "media_type": task_info["media_type"],
-                        "seed_ids": set(),
-                    }
-
-                candidates[key]["seed_ids"].add(
-                    task_info["seed_id"]
-                )
-
-        results = list(candidates.values())
-
-        # TMDB provides relevance through its recommendation endpoint.
-        # We use popularity to order the returned recommendations.
-        results.sort(
-            key=lambda candidate: (
-                float(candidate["item"].get("popularity") or 0),
-                len(candidate["seed_ids"]),
-            ),
-            reverse=True,
-        )
-
-        return results
 
     # ==================================================
-    # BUILD DISCOVERY PARAMETERS
+    # RUN ONE INDEPENDENT DISCOVERY QUERY
     # ==================================================
 
-    def _build_discovery_params(
+    async def _run_discovery_query(
         self,
         row,
         media_type: str,
@@ -568,7 +573,10 @@ class PlatformHomeService:
         page: int,
         keyword_ids: list[int],
         strategy: str,
-    ) -> dict:
+    ):
+
+        if not source_ids:
+            return None
 
         params = {
             "page": page,
@@ -579,12 +587,6 @@ class PlatformHomeService:
                 media_type,
             ),
         }
-
-        overrides = row.query_overrides or {}
-
-        # --------------------------------------------------
-        # WATCH PROVIDER FILTER
-        # --------------------------------------------------
 
         if source_name == "provider":
 
@@ -598,53 +600,17 @@ class PlatformHomeService:
             if media_type == "movie":
                 params["region"] = region
 
-        # --------------------------------------------------
-        # NETWORK FILTER
-        # --------------------------------------------------
-
         elif source_name == "network":
-
-            params["with_watch_providers"] = "|".join(
-                str(value) for value in self._clean_ids(
-                    overrides.get("_provider_ids", [])
-                )
-            )
-
-            params["watch_region"] = region
-            params["with_watch_monetization_types"] = "flatrate"
 
             params["with_networks"] = "|".join(
                 str(value) for value in source_ids
             )
 
-        # --------------------------------------------------
-        # PRODUCTION COMPANY FILTER
-        # --------------------------------------------------
-
         elif source_name == "company":
-
-            provider_ids = self._clean_ids(
-                overrides.get("_provider_ids", [])
-            )
-
-            if provider_ids:
-                params["with_watch_providers"] = "|".join(
-                    str(value) for value in provider_ids
-                )
-
-                params["watch_region"] = region
-                params["with_watch_monetization_types"] = "flatrate"
-
-                if media_type == "movie":
-                    params["region"] = region
 
             params["with_companies"] = "|".join(
                 str(value) for value in source_ids
             )
-
-        # --------------------------------------------------
-        # GENRE FILTER
-        # --------------------------------------------------
 
         genre_ids = self._clean_ids(
             row.genre_ids or []
@@ -655,18 +621,10 @@ class PlatformHomeService:
                 str(value) for value in genre_ids
             )
 
-        # --------------------------------------------------
-        # KEYWORD FILTER
-        # --------------------------------------------------
-
         if keyword_ids:
             params["with_keywords"] = "|".join(
                 str(value) for value in keyword_ids
             )
-
-        # --------------------------------------------------
-        # STRATEGY FILTERS
-        # --------------------------------------------------
 
         goal = self._get_slider_goal(strategy)
 
@@ -683,115 +641,33 @@ class PlatformHomeService:
 
             params[date_field] = date.today().isoformat()
 
-        # --------------------------------------------------
-        # SAFE TMDB OVERRIDES
-        # --------------------------------------------------
-
-        protected = {
-            "page",
-            "language",
-            "include_adult",
-            "region",
-            "watch_region",
-            "with_watch_providers",
-            "with_watch_monetization_types",
-            "with_networks",
-            "with_companies",
-            "with_genres",
-            "with_keywords",
-            "sort_by",
-        }
-
-        for key, value in overrides.items():
-
-            if key in protected or key.startswith("_"):
-                continue
-
-            if value is None:
-                continue
-
-            if isinstance(value, (str, int, float, bool)):
-                params[key] = value
-
-            elif isinstance(value, list):
-                params[key] = "|".join(
-                    str(item) for item in value
-                )
-
-        # Always retain provider filtering on network/company queries.
-        if source_name in {"network", "company"}:
-
-            provider_ids = self._clean_ids(
-                overrides.get("_provider_ids", [])
-            )
-
-            if provider_ids:
-
-                params["with_watch_providers"] = "|".join(
-                    str(value) for value in provider_ids
-                )
-
-                params["watch_region"] = region
-                params["with_watch_monetization_types"] = "flatrate"
-
-                if media_type == "movie":
-                    params["region"] = region
-
-        return params
-
-    # ==================================================
-    # RUN ONE DISCOVERY QUERY
-    # ==================================================
-
-    async def _run_discovery_query(
-        self,
-        row,
-        media_type: str,
-        source_name: str,
-        source_ids: list[int],
-        provider_ids: list[int],
-        region: str,
-        language: str,
-        page: int,
-        keyword_ids: list[int],
-        strategy: str,
-    ):
-
-        if not source_ids:
-            return None
-
-        overrides = dict(row.query_overrides or {})
-
-        # Internal parameter used only when constructing the query.
-        overrides["_provider_ids"] = provider_ids
-
-        # Build parameters using the slider's configured filters.
-        params = self._build_discovery_params(
-            row=row,
-            media_type=media_type,
-            source_name=source_name,
-            source_ids=source_ids,
-            region=region,
-            language=language,
-            page=page,
-            keyword_ids=keyword_ids,
-            strategy=strategy,
+        self._apply_overrides(
+            params,
+            row.query_overrides or {},
         )
 
-        # The helper receives the original row overrides. Rebuild the
-        # provider filters here so company/network queries also require
-        # availability on the platform's provider.
-        if source_name in {"network", "company"} and provider_ids:
+        # Keep source filters protected from overrides.
+
+        if source_name == "provider":
 
             params["with_watch_providers"] = "|".join(
-                str(value) for value in provider_ids
+                str(value) for value in source_ids
             )
 
             params["watch_region"] = region
             params["with_watch_monetization_types"] = "flatrate"
 
-            if media_type == "movie":
-                params["region"] = region
+        elif source_name == "network":
+
+            params["with_networks"] = "|".join(
+                str(value) for value in source_ids
+            )
+
+        elif source_name == "company":
+
+            params["with_companies"] = "|".join(
+                str(value) for value in source_ids
+            )
 
         try:
             return await self.tmdb.discover(
@@ -811,6 +687,186 @@ class PlatformHomeService:
             )
 
             return None
+
+    # ==================================================
+    # FETCH ACTUAL TMDB TRENDING ORDER
+    # ==================================================
+
+    async def _get_trending_order(
+        self,
+        media_type: str,
+        page: int,
+    ) -> dict:
+
+        try:
+            payload = await self.tmdb.trending(
+                media_type,
+                window="week",
+                page=page,
+            )
+
+            results = payload.get("results", [])
+
+            return {
+                item["id"]: position
+                for position, item in enumerate(results)
+                if item.get("id")
+            }
+
+        except Exception as exc:
+
+            logger.warning(
+                "Trending lookup failed: media_type=%s error=%s",
+                media_type,
+                str(exc),
+            )
+
+            return {}
+
+    # ==================================================
+    # SOURCE RELEVANCE FOR EACH SLIDER GOAL
+    # ==================================================
+
+    def _get_source_score(
+        self,
+        sources: set[str],
+        strategy: str,
+    ) -> int:
+
+        strategy = (strategy or "").lower()
+
+        # Franchise-related titles receive priority over ordinary
+        # provider, network and company discovery candidates.
+        if "franchise" in sources:
+            return 40
+
+        # A slider focused on providers prioritises provider results.
+        if strategy.startswith("provider_"):
+            return 30 if "provider" in sources else 0
+
+        # A network slider prioritises network results.
+        if strategy.startswith("network_"):
+            return 30 if "network" in sources else 0
+
+        # A company slider prioritises production company results.
+        if strategy.startswith("company_"):
+            return 30 if "company" in sources else 0
+
+        # Generic sliders treat all discovery sources equally.
+        return 0
+
+    # ==================================================
+    # RANK ONE SLIDER'S CONTENT
+    # ==================================================
+
+    def _rank_slider_results(
+        self,
+        entries: list[dict],
+        strategy: str,
+        viewer_profile: Profile,
+        trending_order: dict,
+    ) -> list[dict]:
+
+        goal = self._get_slider_goal(strategy)
+
+        preferences = viewer_profile.preferences or {}
+
+        if not isinstance(preferences, dict):
+            preferences = {}
+
+        preferred_genres = set(
+            self._clean_ids(
+                preferences.get("preferred_genres", [])
+            )
+        )
+
+        def genre_overlap(item):
+
+            return len(
+                set(item["genre_ids"]) & preferred_genres
+            )
+
+        def sort_key(entry):
+
+            item = entry["item"]
+
+            source_score = self._get_source_score(
+                entry["sources"],
+                strategy,
+            )
+
+            boosted = entry["boosted"]
+
+            popularity = item["popularity"]
+            vote_average = item["vote_average"]
+            vote_count = item["vote_count"]
+
+            if goal == "trending":
+
+                trend_position = trending_order.get(
+                    item["tmdb_id"],
+                    9999,
+                )
+
+                return (
+                    boosted,
+                    trend_position,
+                    source_score,
+                    popularity,
+                )
+
+            if goal == "top_rated":
+
+                return (
+                    boosted,
+                    source_score,
+                    vote_average,
+                    vote_count,
+                    popularity,
+                )
+
+            if goal == "recent":
+
+                return (
+                    boosted,
+                    source_score,
+                    item.get("release_date") or "",
+                    popularity,
+                )
+
+            if goal == "personalized":
+
+                return (
+                    boosted,
+                    genre_overlap(item),
+                    source_score,
+                    popularity,
+                    vote_average,
+                )
+
+            if goal == "genre":
+
+                return (
+                    boosted,
+                    genre_overlap(item),
+                    source_score,
+                    popularity,
+                )
+
+            # Default goal: popular content.
+            return (
+                boosted,
+                source_score,
+                popularity,
+                vote_average,
+            )
+
+        entries.sort(
+            key=sort_key,
+            reverse=True,
+        )
+
+        return entries
 
     # ==================================================
     # QUERY ONE SLIDER
@@ -842,7 +898,7 @@ class PlatformHomeService:
             row.strategy or ""
         ).strip().lower()
 
-        overrides = row.query_overrides or {}
+        goal = self._get_slider_goal(strategy)
 
         slider_media_types = {
             "mixed": ["movie", "tv"],
@@ -860,7 +916,7 @@ class PlatformHomeService:
             return [], False
 
         # --------------------------------------------------
-        # PROVIDER IDS
+        # PROVIDERS
         # --------------------------------------------------
 
         provider_ids = self._clean_ids([
@@ -873,15 +929,8 @@ class PlatformHomeService:
             )
         ])
 
-        if not provider_ids:
-            logger.warning(
-                "Slider has no watch providers configured: %s",
-                row.key,
-            )
-            return [], False
-
         # --------------------------------------------------
-        # NETWORK IDS
+        # NETWORKS
         # --------------------------------------------------
 
         network_values = [
@@ -894,19 +943,24 @@ class PlatformHomeService:
             for item in slider_config["networks"]
         ])
 
-        override_networks = overrides.get("with_networks", [])
-
-        if not isinstance(override_networks, list):
-            override_networks = str(
-                override_networks
+        network_values.extend(
+            (row.query_overrides or {}).get(
+                "with_networks",
+                [],
+            )
+            if isinstance(
+                (row.query_overrides or {}).get("with_networks", []),
+                list,
+            )
+            else str(
+                (row.query_overrides or {}).get("with_networks", "")
             ).replace(",", "|").split("|")
-
-        network_values.extend(override_networks)
+        )
 
         network_ids = self._clean_ids(network_values)
 
         # --------------------------------------------------
-        # COMPANY IDS
+        # COMPANIES
         # --------------------------------------------------
 
         company_values = [
@@ -919,7 +973,9 @@ class PlatformHomeService:
             for item in slider_config["companies"]
         ])
 
-        override_companies = overrides.get("with_companies", [])
+        override_companies = (
+            row.query_overrides or {}
+        ).get("with_companies", [])
 
         if not isinstance(override_companies, list):
             override_companies = str(
@@ -930,12 +986,8 @@ class PlatformHomeService:
 
         company_ids = self._clean_ids(company_values)
 
-        # --------------------------------------------------
-        # MEDIA SCOPE RESTRICTIONS
-        # --------------------------------------------------
-
+        # Network discovery applies to television.
         if strategy.startswith("network_"):
-
             media_types = [
                 media_type
                 for media_type in media_types
@@ -947,7 +999,10 @@ class PlatformHomeService:
             for item in slider_config["excluded_titles"]
         }
 
+        # Candidate records retain source information.
         candidates = {}
+
+        boosted_keys = set()
         has_more = False
 
         # --------------------------------------------------
@@ -981,12 +1036,6 @@ class PlatformHomeService:
             if not item:
                 continue
 
-            if not self._allowed_for_profile(
-                item,
-                viewer_profile,
-            ):
-                continue
-
             available = await self._has_subscription_availability(
                 tmdb_id=curated_item.tmdb_id,
                 media_type=curated_item.media_type,
@@ -1003,60 +1052,231 @@ class PlatformHomeService:
                 "media_type": curated_item.media_type,
                 "curated": True,
                 "curated_priority": curated_item.priority,
+                "sources": set(),
+                "boosted": False,
             }
 
+
         # --------------------------------------------------
-        # 2. TMDB FRANCHISE RECOMMENDATIONS
+        # 1B. FRANCHISE / CURATED TITLE EXPANSION
         # --------------------------------------------------
 
-        franchise_mode = bool(
-            overrides.get("franchise_mode", False)
+        overrides = row.query_overrides or {}
+
+        expand_curated_titles = bool(
+            overrides.get("expand_curated_titles", False)
         )
 
-        if franchise_mode and curated:
+        if expand_curated_titles and curated:
 
-            related_candidates = await self._get_franchise_candidates(
-                curated_titles=curated,
-                media_types=media_types,
-                language=language,
-                profile=viewer_profile,
+            # Only allow the two supported TMDB related-content sources.
+            related_sources = overrides.get(
+                "related_content_sources",
+                ["recommendations", "similar"],
             )
 
-            for related in related_candidates:
+            if isinstance(related_sources, str):
+                related_sources = [
+                    value.strip().lower()
+                    for value in related_sources.replace(",", "|").split("|")
+                    if value.strip()
+                ]
 
-                item = related["item"]
-                media_type = related["media_type"]
+            if not isinstance(related_sources, list):
+                related_sources = [
+                    "recommendations",
+                    "similar",
+                ]
 
-                tmdb_id = item.get("id")
+            related_sources = [
+                source.strip().lower()
+                for source in related_sources
+                if isinstance(source, str)
+                and source.strip().lower() in {
+                    "recommendations",
+                    "similar",
+                }
+            ]
 
-                if not tmdb_id:
+            # Remove duplicate source names.
+            related_sources = list(dict.fromkeys(related_sources))
+
+            # Maximum related titles requested per seed.
+            try:
+                related_limit = int(
+                    overrides.get("related_titles_per_seed", 15)
+                )
+            except (TypeError, ValueError):
+                related_limit = 15
+
+            related_limit = max(
+                1,
+                min(related_limit, 30),
+            )
+
+            # If the slider has configured genres, related titles
+            # should match at least one of those genres by default.
+            try:
+                minimum_genre_match = int(
+                    overrides.get("related_min_genre_match", 1)
+                )
+            except (TypeError, ValueError):
+                minimum_genre_match = 1
+
+            minimum_genre_match = max(
+                0,
+                min(minimum_genre_match, 5),
+            )
+
+            slider_genres = set(
+                self._clean_ids(row.genre_ids or [])
+            )
+
+            related_tasks = []
+
+            for curated_item in curated:
+
+                if curated_item.media_type not in media_types:
                     continue
 
-                key = (int(tmdb_id), media_type)
+                for source in related_sources:
 
-                if key in excluded or key in candidates:
+                    related_tasks.append({
+                        "seed_id": curated_item.tmdb_id,
+                        "media_type": curated_item.media_type,
+                        "source": source,
+                        "task": self._get_related_titles(
+                            tmdb_id=curated_item.tmdb_id,
+                            media_type=curated_item.media_type,
+                            source=source,
+                            language=language,
+                        ),
+                    })
+
+            related_responses = await asyncio.gather(
+                *[
+                    task_info["task"]
+                    for task_info in related_tasks
+                ],
+                return_exceptions=True,
+            )
+
+            related_candidates = {}
+
+            for task_info, related_items in zip(
+                related_tasks,
+                related_responses,
+            ):
+
+                if isinstance(related_items, Exception):
                     continue
 
-                available = await self._has_subscription_availability(
-                    tmdb_id=tmdb_id,
-                    media_type=media_type,
-                    region=region,
-                    provider_ids=provider_ids,
-                    availability_cache=availability_cache,
+                for item in (related_items or [])[:related_limit]:
+
+                    tmdb_id = item.get("id")
+
+                    if not tmdb_id:
+                        continue
+
+                    related_media_type = task_info["media_type"]
+
+                    key = (
+                        tmdb_id,
+                        related_media_type,
+                    )
+
+                    if key in excluded:
+                        continue
+
+                    # Never replace a curated title with a recommendation.
+                    if key in candidates and candidates[key]["curated"]:
+                        continue
+
+                    # Apply the selected profile's restrictions early.
+                    if not self._allowed_for_profile(
+                        item,
+                        viewer_profile,
+                    ):
+                        continue
+
+                    # Respect the slider's configured genre focus.
+                    if slider_genres and minimum_genre_match > 0:
+
+                        item_genres = self._get_genre_ids(item)
+
+                        if len(item_genres & slider_genres) < minimum_genre_match:
+                            continue
+
+                    if key not in related_candidates:
+
+                        related_candidates[key] = {
+                            "item": item,
+                            "media_type": related_media_type,
+                            "sources": {"franchise"},
+                        }
+
+            # Validate actual subscription availability before adding
+            # related titles to the slider.
+            availability_tasks = []
+
+            related_keys = list(related_candidates.keys())
+
+            for key in related_keys:
+
+                tmdb_id, related_media_type = key
+
+                availability_tasks.append(
+                    self._has_subscription_availability(
+                        tmdb_id=tmdb_id,
+                        media_type=related_media_type,
+                        region=region,
+                        provider_ids=provider_ids,
+                        availability_cache=availability_cache,
+                    )
                 )
 
-                if not available:
+            availability_results = await asyncio.gather(
+                *availability_tasks,
+                return_exceptions=True,
+            )
+
+            for key, available in zip(
+                related_keys,
+                availability_results,
+            ):
+
+                if isinstance(available, Exception) or not available:
                     continue
 
-                candidates[key] = {
-                    "item": item,
-                    "media_type": media_type,
-                    "curated": False,
-                    "curated_priority": None,
-                }
+                related_candidate = related_candidates[key]
+
+                if key in candidates:
+
+                    # A title may already have come from provider,
+                    # network, company or collection discovery.
+                    candidates[key]["sources"].add("franchise")
+
+                else:
+
+                    candidates[key] = {
+                        "item": related_candidate["item"],
+                        "media_type": related_candidate["media_type"],
+                        "curated": False,
+                        "curated_priority": None,
+                        "sources": {"franchise"},
+                        "boosted": False,
+                    }
+
+            logger.info(
+                "Franchise expansion completed: slider=%s "
+                "seeds=%s related_candidates=%s",
+                row.key,
+                len(curated),
+                len(related_candidates),
+            )
 
         # --------------------------------------------------
-        # 3. TMDB COLLECTIONS
+        # 2. COLLECTION CONTENT
         # --------------------------------------------------
 
         collections = sorted(
@@ -1083,15 +1303,9 @@ class PlatformHomeService:
                 if not tmdb_id:
                     continue
 
-                key = (int(tmdb_id), media_type)
+                key = (tmdb_id, media_type)
 
                 if key in excluded or key in candidates:
-                    continue
-
-                if not self._allowed_for_profile(
-                    item,
-                    viewer_profile,
-                ):
                     continue
 
                 available = await self._has_subscription_availability(
@@ -1110,10 +1324,12 @@ class PlatformHomeService:
                     "media_type": media_type,
                     "curated": False,
                     "curated_priority": None,
+                    "sources": {"collection"},
+                    "boosted": False,
                 }
 
         # --------------------------------------------------
-        # 4. KEYWORD CONFIGURATION
+        # 3. KEYWORDS
         # --------------------------------------------------
 
         include_keyword_ids = self._clean_ids([
@@ -1122,25 +1338,21 @@ class PlatformHomeService:
             if item.match_type == "include"
         ])
 
+        boost_keyword_ids = self._clean_ids([
+            item.tmdb_keyword_id
+            for item in slider_config["keywords"]
+            if item.match_type == "boost"
+        ])
+
         # --------------------------------------------------
-        # 5. TMDB DISCOVER QUERIES
+        # 4. DISCOVERY FROM ALL THREE SOURCES
         # --------------------------------------------------
 
         discovery_sources = [
             ("provider", provider_ids),
+            ("network", network_ids),
+            ("company", company_ids),
         ]
-
-        # Network/company searches are supplementary filters.
-        # They still include the platform's watch provider.
-        if network_ids:
-            discovery_sources.append(
-                ("network", network_ids)
-            )
-
-        if company_ids:
-            discovery_sources.append(
-                ("company", company_ids)
-            )
 
         discovery_tasks = []
 
@@ -1148,15 +1360,18 @@ class PlatformHomeService:
 
             for source_name, source_ids in discovery_sources:
 
+                if not source_ids:
+                    continue
+
                 discovery_tasks.append({
                     "source": source_name,
                     "media_type": media_type,
+                    "is_boost": False,
                     "task": self._run_discovery_query(
                         row=row,
                         media_type=media_type,
                         source_name=source_name,
                         source_ids=source_ids,
-                        provider_ids=provider_ids,
                         region=region,
                         language=language,
                         page=page,
@@ -1165,21 +1380,86 @@ class PlatformHomeService:
                     ),
                 })
 
+                if boost_keyword_ids:
+
+                    discovery_tasks.append({
+                        "source": source_name,
+                        "media_type": media_type,
+                        "is_boost": True,
+                        "task": self._run_discovery_query(
+                            row=row,
+                            media_type=media_type,
+                            source_name=source_name,
+                            source_ids=source_ids,
+                            region=region,
+                            language=language,
+                            page=page,
+                            keyword_ids=boost_keyword_ids,
+                            strategy=strategy,
+                        ),
+                    })
+
+        # Actual trending data is used as a ranking signal.
+        # It does not replace the three discovery sources.
+        trending_tasks = {}
+
+        if goal == "trending":
+
+            for media_type in media_types:
+
+                trending_tasks[media_type] = (
+                    self._get_trending_order(
+                        media_type,
+                        page,
+                    )
+                )
+
+        all_tasks = [
+            task_info["task"]
+            for task_info in discovery_tasks
+        ]
+
+        trending_media_types = list(
+            trending_tasks.keys()
+        )
+
+        all_tasks.extend([
+            trending_tasks[media_type]
+            for media_type in trending_media_types
+        ])
+
         responses = await asyncio.gather(
-            *[
-                item["task"]
-                for item in discovery_tasks
-            ],
+            *all_tasks,
             return_exceptions=True,
         )
 
+        discovery_responses = responses[
+            :len(discovery_tasks)
+        ]
+
+        trending_responses = responses[
+            len(discovery_tasks):
+        ]
+
+        trending_order = {}
+
+        for media_type, payload in zip(
+            trending_media_types,
+            trending_responses,
+        ):
+
+            if isinstance(payload, Exception):
+                continue
+
+            trending_order[media_type] = payload or {}
+
         # --------------------------------------------------
-        # 6. MERGE DISCOVER RESULTS
+        # 5. MERGE DISCOVERY RESULTS
         # --------------------------------------------------
 
         for task_info, payload in zip(
             discovery_tasks,
-            responses,
+            discovery_responses,
         ):
 
             if isinstance(payload, Exception):
@@ -1199,7 +1479,9 @@ class PlatformHomeService:
             if int(payload.get("total_pages") or 0) > page:
                 has_more = True
 
+            source_name = task_info["source"]
             media_type = task_info["media_type"]
+            is_boost = task_info["is_boost"]
 
             for item in payload.get("results", []):
 
@@ -1208,40 +1490,45 @@ class PlatformHomeService:
                 if not tmdb_id:
                     continue
 
-                key = (
-                    int(tmdb_id),
-                    media_type,
-                )
+                key = (tmdb_id, media_type)
 
                 if key in excluded:
                     continue
 
-                if key in candidates:
-                    continue
+                if key not in candidates:
 
-                if not self._allowed_for_profile(
-                    item,
-                    viewer_profile,
-                ):
-                    continue
+                    candidates[key] = {
+                        "item": item,
+                        "media_type": media_type,
+                        "curated": False,
+                        "curated_priority": None,
+                        "sources": set(),
+                        "boosted": False,
+                    }
 
-                candidates[key] = {
-                    "item": item,
-                    "media_type": media_type,
-                    "curated": False,
-                    "curated_priority": None,
-                }
+                candidate = candidates[key]
+
+                candidate["sources"].add(source_name)
+
+                if is_boost:
+                    candidate["boosted"] = True
 
         # --------------------------------------------------
-        # 7. NORMALIZE AND SORT
+        # 6. PROFILE FILTERING AND NORMALIZATION
         # --------------------------------------------------
 
         curated_entries = []
         normal_entries = []
 
-        for candidate in candidates.values():
+        for key, candidate in candidates.items():
 
             item = candidate["item"]
+
+            if not self._allowed_for_profile(
+                item,
+                viewer_profile,
+            ):
+                continue
 
             normalized_item = self._normalize_title(
                 item,
@@ -1250,6 +1537,8 @@ class PlatformHomeService:
 
             entry = {
                 "item": normalized_item,
+                "sources": candidate["sources"],
+                "boosted": candidate["boosted"],
                 "curated": candidate["curated"],
                 "curated_priority": candidate["curated_priority"],
             }
@@ -1259,6 +1548,57 @@ class PlatformHomeService:
             else:
                 normal_entries.append(entry)
 
+        # --------------------------------------------------
+        # 7. RANK ACCORDING TO THE SLIDER GOAL
+        # --------------------------------------------------
+
+        for media_type, order in trending_order.items():
+
+            # Trending positions are stored per media type.
+            for entry in normal_entries:
+
+                item = entry["item"]
+
+                if item["media_type"] == media_type:
+                    item["_trending_position"] = order.get(
+                        item["tmdb_id"],
+                        9999,
+                    )
+
+        # Ranking function uses the temporary trending position.
+        if goal == "trending":
+
+            for entry in normal_entries:
+
+                item = entry["item"]
+
+                item["_trending_position"] = (
+                    item.get("_trending_position", 9999)
+                )
+
+            normal_entries.sort(
+                key=lambda entry: (
+                    entry["boosted"],
+                    -entry["item"].get("_trending_position", 9999),
+                    self._get_source_score(
+                        entry["sources"],
+                        strategy,
+                    ),
+                    entry["item"]["popularity"],
+                ),
+                reverse=True,
+            )
+
+        else:
+
+            normal_entries = self._rank_slider_results(
+                entries=normal_entries,
+                strategy=strategy,
+                viewer_profile=viewer_profile,
+                trending_order={},
+            )
+
+        # Preserve configured curated priority.
         curated_entries.sort(
             key=lambda entry: (
                 entry["curated_priority"]
@@ -1267,17 +1607,9 @@ class PlatformHomeService:
             )
         )
 
-        # Popularity descending is the default for all normal
-        # homepage slider content, including recommendations and
-        # collection titles.
-        normal_entries.sort(
-            key=lambda entry: (
-                entry["item"]["popularity"],
-                entry["item"]["vote_count"],
-                entry["item"]["vote_average"],
-            ),
-            reverse=True,
-        )
+        # --------------------------------------------------
+        # 8. ASSEMBLE RESULTS
+        # --------------------------------------------------
 
         results = [
             entry["item"]
@@ -1290,7 +1622,7 @@ class PlatformHomeService:
         ])
 
         # --------------------------------------------------
-        # 8. REMOVE DUPLICATES
+        # 9. REMOVE DUPLICATES
         # --------------------------------------------------
 
         unique = []
@@ -1307,11 +1639,12 @@ class PlatformHomeService:
                 continue
 
             seen.add(key)
+
+            # Internal ranking fields must not reach the frontend.
+            item.pop("_trending_position", None)
+
             unique.append(item)
 
-        # --------------------------------------------------
-        # 9. RETURN A CANDIDATE POOL
-        # --------------------------------------------------
 
         configured_page_size = (
             row.page_size
@@ -1324,59 +1657,96 @@ class PlatformHomeService:
             1,
         )
 
-        # Fetch a reserve pool so the homepage uniqueness engine
-        # can fill rows after removing titles used elsewhere.
+        # Keep a larger reserve pool so the diversity engine
+        # can replace titles already displayed in other sliders.
         candidate_limit = min(
-            max(page_size * 3, page_size + 20),
+            max(
+                page_size * 3,
+                page_size + 20,
+            ),
             100,
         )
+
+        # Preserve curated metadata internally until the diversity
+        # engine has selected the final titles for this slider.
+        for item in unique:
+
+            item["_is_curated"] = False
+            item["_curated_priority"] = None
+
+        # Reapply curated metadata using the original curated entries.
+        curated_metadata = {}
+
+        for entry in curated_entries:
+
+            item = entry["item"]
+
+            key = (
+                item["tmdb_id"],
+                item["media_type"],
+            )
+
+            curated_metadata[key] = {
+                "priority": entry["curated_priority"],
+            }
+
+        for item in unique:
+
+            key = (
+                item["tmdb_id"],
+                item["media_type"],
+            )
+
+            metadata = curated_metadata.get(key)
+
+            if metadata is not None:
+
+                item["_is_curated"] = True
+                item["_curated_priority"] = metadata["priority"]
 
         return unique[:candidate_limit], has_more
 
     # ==================================================
-    # CROSS-SLIDER TITLE UNIQUENESS
+    # CROSS-SLIDER DIVERSITY ENGINE
     # ==================================================
 
-    def _apply_slider_uniqueness(
+    def _apply_slider_diversity(
         self,
         sliders: list[dict],
     ) -> list[dict]:
         """
-        Each title may appear only once across the homepage.
+        Reduces unnecessary title repetition across homepage sliders.
 
-        The first slider in display order gets priority.
-        Continue Watching titles are also reserved and cannot
-        appear again in discovery sliders.
+        Rules:
+        - A title should normally appear in no more than 2 sliders.
+        - Curated titles are protected in their configured slider.
+        - Alternative candidates replace repeated titles where possible.
+        - Repeated titles are allowed when there are not enough alternatives.
+        - Internal ranking fields are removed before returning the response.
         """
 
-        used_titles = set()
-
-        # --------------------------------------------------
-        # RESERVE CONTINUE WATCHING TITLES
-        # --------------------------------------------------
+        appearance_counts = {}
 
         for slider in sliders:
 
-            if "_candidate_pool" in slider:
-                continue
-
-            for item in slider.get("results", []):
-
-                key = (
-                    item.get("tmdb_id"),
-                    item.get("media_type"),
-                )
-
-                if key[0] is not None and key[1] is not None:
-                    used_titles.add(key)
-
-        # --------------------------------------------------
-        # SELECT UNIQUE TITLES FOR EACH DISCOVERY SLIDER
-        # --------------------------------------------------
-
-        for slider in sliders:
-
+            # Continue Watching has no discovery candidate pool.
+            # Count its titles so discovery sliders can prefer alternatives.
             if "_candidate_pool" not in slider:
+
+                for item in slider.get("results", []):
+
+                    key = (
+                        item.get("tmdb_id"),
+                        item.get("media_type"),
+                    )
+
+                    if key[0] is None or key[1] is None:
+                        continue
+
+                    appearance_counts[key] = (
+                        appearance_counts.get(key, 0) + 1
+                    )
+
                 continue
 
             candidate_pool = slider.pop(
@@ -1389,14 +1759,34 @@ class PlatformHomeService:
                 20,
             )
 
-            page_size = max(
-                int(page_size or 20),
-                1,
-            )
+            page_size = max(int(page_size or 20), 1)
 
-            selected = []
+            curated_candidates = [
+                item
+                for item in candidate_pool
+                if item.get("_is_curated", False)
+            ]
 
-            for item in candidate_pool:
+            normal_candidates = [
+                item
+                for item in candidate_pool
+                if not item.get("_is_curated", False)
+            ]
+
+            # Curated titles are already sorted by configured priority.
+            selected = curated_candidates[:page_size]
+
+            selected_keys = {
+                (
+                    item.get("tmdb_id"),
+                    item.get("media_type"),
+                )
+                for item in selected
+            }
+
+            # First pass: prefer titles that have appeared fewer than
+            # two times across the homepage.
+            for item in normal_candidates:
 
                 if len(selected) >= page_size:
                     break
@@ -1406,14 +1796,51 @@ class PlatformHomeService:
                     item.get("media_type"),
                 )
 
-                if key[0] is None or key[1] is None:
+                if key in selected_keys:
                     continue
 
-                if key in used_titles:
+                if appearance_counts.get(key, 0) >= 2:
                     continue
 
                 selected.append(item)
-                used_titles.add(key)
+                selected_keys.add(key)
+
+            # Second pass: if the row is still not full, allow repeats.
+            # This prevents the diversity engine from creating short rows.
+            if len(selected) < page_size:
+
+                for item in normal_candidates:
+
+                    if len(selected) >= page_size:
+                        break
+
+                    key = (
+                        item.get("tmdb_id"),
+                        item.get("media_type"),
+                    )
+
+                    if key in selected_keys:
+                        continue
+
+                    selected.append(item)
+                    selected_keys.add(key)
+
+            # Update the homepage-wide appearance counts.
+            for item in selected:
+
+                key = (
+                    item.get("tmdb_id"),
+                    item.get("media_type"),
+                )
+
+                appearance_counts[key] = (
+                    appearance_counts.get(key, 0) + 1
+                )
+
+                # Remove internal fields before the frontend response.
+                item.pop("_is_curated", None)
+                item.pop("_curated_priority", None)
+                item.pop("_trending_position", None)
 
             slider["results"] = selected
 
@@ -1514,6 +1941,7 @@ class PlatformHomeService:
                 page=1,
             )
 
+
             configured_page_size = (
                 row.page_size
                 or platform_profile.default_row_count
@@ -1530,25 +1958,31 @@ class PlatformHomeService:
                 "title": row.title,
                 "strategy": row.strategy,
                 "media_scope": row.media_scope,
+
+                # The diversity engine will select the final row.
                 "results": [],
+
+                # Temporary internal data, removed before the response.
                 "_candidate_pool": results,
                 "_page_size": page_size,
             })
 
             logger.info(
                 "Platform slider assembled: platform=%s slider=%s "
-                "results=%s has_more=%s",
+                "goal=%s results=%s has_more=%s",
                 platform.slug,
                 row.key,
+                self._get_slider_goal(row.strategy),
                 len(results),
                 has_more,
             )
 
+
         # --------------------------------------------------
-        # ENFORCE HOMEPAGE-WIDE UNIQUENESS
+        # APPLY CROSS-SLIDER DIVERSITY
         # --------------------------------------------------
 
-        sliders = self._apply_slider_uniqueness(sliders)
+        sliders = self._apply_slider_diversity(sliders)
 
         # --------------------------------------------------
         # FRONTEND RESPONSE

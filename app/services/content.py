@@ -1043,14 +1043,675 @@ def _unified_discovery_collection(
 
     return results[:page_size]
 
+
+def _get_section_preferences(profile: Profile) -> dict:
+    """
+    Return the profile's learned genre and keyword preferences.
+
+    The stored preference objects are passed through without changing
+    their weights or names.
+    """
+    preferences = profile.preferences or {}
+
+    return {
+        "genre_preferences": preferences.get("genre_preferences") or [],
+        "keyword_preferences": preferences.get("keyword_preferences") or [],
+    }
+
+
+def _get_preference_ids(preferences: list[dict], id_key: str) -> list[int]:
+    """Extract valid integer IDs from preference objects."""
+    results = []
+
+    for item in preferences:
+        if not isinstance(item, dict):
+            continue
+
+        value = item.get(id_key)
+
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            continue
+
+        if value not in results:
+            results.append(value)
+
+    return results
+
+
+def _get_preference_source(profile_preferences: dict, has_defaults: bool = False) -> str:
+    """Describe whether a section uses learned or default preferences."""
+    has_profile_preferences = bool(
+        profile_preferences.get("genre_preferences")
+        or profile_preferences.get("keyword_preferences")
+    )
+
+    if has_profile_preferences and has_defaults:
+        return "mixed"
+
+    if has_profile_preferences:
+        return "profile"
+
+    return "default"
+
+
+
+def _build_unified_content_sources(
+    db: Session,
+    platforms: list[StreamingPlatform],
+) -> list[dict]:
+    """
+    Build region/language-specific discovery sources from entitled
+    platforms only.
+
+    This function performs database queries only. It does not call TMDB.
+    """
+
+    if not platforms:
+        return []
+
+    platform_ids = [platform.id for platform in platforms]
+
+    configs = db.scalars(
+        select(PlatformProfile).where(
+            PlatformProfile.platform_id.in_(platform_ids),
+            PlatformProfile.enabled.is_(True),
+        )
+    ).all()
+
+    config_by_platform = {
+        config.platform_id: config
+        for config in configs
+    }
+
+    eligible_platforms = [
+        platform
+        for platform in platforms
+        if platform.id in config_by_platform
+    ]
+
+    if not eligible_platforms:
+        return []
+
+    platform_by_id = {
+        platform.id: platform
+        for platform in eligible_platforms
+    }
+
+    groups = {}
+
+    for platform in eligible_platforms:
+        config = config_by_platform[platform.id]
+
+        region_code = config.region_code or settings.tmdb_region
+        language = config.language or settings.tmdb_language
+
+        group_key = (region_code, language)
+
+        if group_key not in groups:
+            groups[group_key] = {
+                "region_code": region_code,
+                "language": language,
+                "platforms": [],
+                "regional_providers": {},
+                "global_providers": {},
+                "production_companies": {},
+                "networks": {},
+            }
+
+        groups[group_key]["platforms"].append(platform)
+
+    # ---------------------------------------------------------
+    # Load watch provider mappings.
+    # ---------------------------------------------------------
+    provider_rows = db.scalars(
+        select(PlatformProvider).where(
+            PlatformProvider.platform_id.in_(
+                [platform.id for platform in eligible_platforms]
+            ),
+            PlatformProvider.provider_kind.in_(
+                ["watch_provider", "tmdb_watch_provider"]
+            ),
+        )
+    ).all()
+
+    for provider in provider_rows:
+        config = config_by_platform.get(provider.platform_id)
+
+        if config is None or provider.external_id is None:
+            continue
+
+        region_code = config.region_code or settings.tmdb_region
+        language = config.language or settings.tmdb_language
+
+        group = groups.get((region_code, language))
+
+        if group is None:
+            continue
+
+        platform = platform_by_id.get(provider.platform_id)
+
+        if platform is None:
+            continue
+
+        mapping = {
+            "provider_id": int(provider.external_id),
+            "provider_name": provider.platform_name,
+            "platform_id": str(platform.id),
+            "platform_name": platform.name,
+            "is_primary": bool(provider.is_primary),
+        }
+
+        if provider.region_code == region_code:
+            group["regional_providers"].setdefault(
+                provider.platform_id, []
+            ).append(mapping)
+
+        elif provider.region_code is None:
+            group["global_providers"].setdefault(
+                provider.platform_id, []
+            ).append(mapping)
+
+    # ---------------------------------------------------------
+    # Load production companies.
+    # ---------------------------------------------------------
+    company_rows = db.scalars(
+        select(PlatformCompany).where(
+            PlatformCompany.platform_id.in_(
+                [platform.id for platform in eligible_platforms]
+            ),
+            PlatformCompany.include_in_discovery.is_(True),
+        )
+    ).all()
+
+    for company in company_rows:
+        platform = platform_by_id.get(company.platform_id)
+
+        if platform is None or not platform.supports_movies:
+            continue
+
+        config = config_by_platform[platform.id]
+        region_code = config.region_code or settings.tmdb_region
+        language = config.language or settings.tmdb_language
+
+        group = groups.get((region_code, language))
+
+        if group is None or company.tmdb_company_id is None:
+            continue
+
+        company_id = int(company.tmdb_company_id)
+
+        entry = group["production_companies"].setdefault(
+            company_id,
+            {
+                "company_id": company_id,
+                "company_name": company.company_name,
+                "platform_ids": [],
+                "relation_types": [],
+                "confidence": company.confidence,
+            },
+        )
+
+        platform_id = str(platform.id)
+
+        if platform_id not in entry["platform_ids"]:
+            entry["platform_ids"].append(platform_id)
+
+        if (
+            company.relation_type
+            and company.relation_type not in entry["relation_types"]
+        ):
+            entry["relation_types"].append(company.relation_type)
+
+    # ---------------------------------------------------------
+    # Load TV networks.
+    # ---------------------------------------------------------
+    network_rows = db.scalars(
+        select(PlatformNetwork).where(
+            PlatformNetwork.platform_id.in_(
+                [platform.id for platform in eligible_platforms]
+            ),
+            PlatformNetwork.include_in_discovery.is_(True),
+        )
+    ).all()
+
+    for network in network_rows:
+        platform = platform_by_id.get(network.platform_id)
+
+        if platform is None or not platform.supports_tv_shows:
+            continue
+
+        config = config_by_platform[platform.id]
+        region_code = config.region_code or settings.tmdb_region
+        language = config.language or settings.tmdb_language
+
+        group = groups.get((region_code, language))
+
+        if group is None or network.tmdb_network_id is None:
+            continue
+
+        network_id = int(network.tmdb_network_id)
+
+        entry = group["networks"].setdefault(
+            network_id,
+            {
+                "network_id": network_id,
+                "network_name": network.network_name,
+                "platform_ids": [],
+            },
+        )
+
+        platform_id = str(platform.id)
+
+        if platform_id not in entry["platform_ids"]:
+            entry["platform_ids"].append(platform_id)
+
+    # ---------------------------------------------------------
+    # Build final region/language groups.
+    # ---------------------------------------------------------
+    results = []
+
+    for group in groups.values():
+
+        # Each platform now has its own descriptive entry.
+        platform_entries = [
+            {
+                "platform_id": str(platform.id),
+                "platform_name": platform.name,
+            }
+            for platform in group["platforms"]
+        ]
+
+        # Build individual provider mappings.
+        provider_entries = {}
+
+        for platform in group["platforms"]:
+            regional = group["regional_providers"].get(
+                platform.id, []
+            )
+
+            global_mappings = group["global_providers"].get(
+                platform.id, []
+            )
+
+            # Regional mappings take precedence over global mappings.
+            candidates = regional or global_mappings
+
+            for mapping in candidates:
+                provider_key = (
+                    mapping["provider_id"],
+                    mapping["platform_id"],
+                )
+
+                provider_entries[provider_key] = mapping
+
+        results.append({
+            "region_code": group["region_code"],
+            "language": group["language"],
+            "platforms": platform_entries,
+            "watch_providers": list(provider_entries.values()),
+            "production_companies": list(
+                group["production_companies"].values()
+            ),
+            "networks": list(group["networks"].values()),
+        })
+
+    return results
+
+
+def _filter_content_sources(
+    source_groups: list[dict],
+    media_type: str,
+) -> list[dict]:
+    """
+    Return only the source types relevant to a content section.
+    """
+
+    results = []
+
+    for group in source_groups:
+        entry = {
+            "region_code": group["region_code"],
+            "language": group["language"],
+            "platforms": group["platforms"],
+            "watch_providers": group["watch_providers"],
+        }
+
+        if media_type == "movie":
+            entry["production_companies"] = group[
+                "production_companies"
+            ]
+
+        elif media_type == "tv":
+            entry["networks"] = group["networks"]
+
+        results.append(entry)
+
+    return results
+
+def _build_recommended_queries(
+    source_groups: list[dict],
+    media_type: str,
+    profile_preferences: dict,
+    default_genre_ids: list[int] | None = None,
+) -> list[dict]:
+    """
+    Generate TMDB query templates for the frontend.
+
+    No TMDB requests are performed here.
+    """
+
+    endpoint = (
+        "/discover/movie"
+        if media_type == "movie"
+        else "/discover/tv"
+    )
+
+    genre_ids = _get_preference_ids(
+        profile_preferences.get("genre_preferences", []),
+        "genre_id",
+    )
+
+    keyword_ids = _get_preference_ids(
+        profile_preferences.get("keyword_preferences", []),
+        "keyword_id",
+    )
+
+    default_genre_ids = default_genre_ids or []
+
+    # Cartoons must always retain their Animation/Family filters.
+    if default_genre_ids:
+        genre_ids = list(dict.fromkeys(
+            default_genre_ids + genre_ids
+        ))
+
+    queries = []
+
+    for group in source_groups:
+        provider_ids = [
+            item["provider_id"]
+            for item in group["watch_providers"]
+        ]
+
+        base_parameters = {
+            "watch_region": group["region_code"],
+            "language": group["language"],
+            "include_adult": False,
+            "sort_by": "popularity.desc",
+        }
+
+        if provider_ids:
+            base_parameters["with_watch_providers"] = "|".join(
+                str(value) for value in sorted(set(provider_ids))
+            )
+
+        # Personalised genre discovery.
+        if genre_ids:
+            parameters = dict(base_parameters)
+            parameters["with_genres"] = "|".join(
+                str(value) for value in genre_ids
+            )
+
+            queries.append({
+                "name": "Personalised " + (
+                    "Movies" if media_type == "movie" else "TV Shows"
+                ),
+                "endpoint": endpoint,
+                "parameters": parameters,
+            })
+
+        # Personalised keyword discovery.
+        if keyword_ids and not default_genre_ids:
+            parameters = dict(base_parameters)
+            parameters["with_keywords"] = "|".join(
+                str(value) for value in keyword_ids
+            )
+
+            queries.append({
+                "name": "Keyword Recommendations",
+                "endpoint": endpoint,
+                "parameters": parameters,
+            })
+
+        # Platform production-company discovery.
+        if media_type == "movie":
+            company_ids = [
+                item["company_id"]
+                for item in group["production_companies"]
+            ]
+
+            if company_ids:
+                parameters = dict(base_parameters)
+                parameters["with_companies"] = "|".join(
+                    str(value) for value in sorted(set(company_ids))
+                )
+
+                queries.append({
+                    "name": "Platform Production Companies",
+                    "endpoint": endpoint,
+                    "parameters": parameters,
+                })
+
+        # Platform network discovery.
+        if media_type == "tv":
+            network_ids = [
+                item["network_id"]
+                for item in group["networks"]
+            ]
+
+            if network_ids:
+                parameters = dict(base_parameters)
+                parameters["with_networks"] = "|".join(
+                    str(value) for value in sorted(set(network_ids))
+                )
+
+                queries.append({
+                    "name": "Platform Networks",
+                    "endpoint": endpoint,
+                    "parameters": parameters,
+                })
+
+        # General popular discovery.
+        queries.append({
+            "name": "Popular " + (
+                "Movies" if media_type == "movie" else "TV Shows"
+            ),
+            "endpoint": endpoint,
+            "parameters": dict(base_parameters),
+        })
+
+    return queries
+
+
+def _get_unified_continue_watching(
+    db: Session,
+    platforms: list[StreamingPlatform],
+    profile: Profile,
+) -> list[dict]:
+    """
+    Return the five most recently watched distinct title records
+    across all entitled platforms.
+
+    Completed titles still count towards the five-record limit.
+    Only unfinished titles watched within the last 72 hours appear.
+    """
+
+    if not platforms:
+        return []
+
+    platform_ids = [platform.id for platform in platforms]
+
+    recent_rows = db.execute(
+        select(WatchProgress, StreamingPlatform)
+        .join(
+            ViewingSession,
+            WatchProgress.last_session_id == ViewingSession.id,
+        )
+        .join(
+            StreamingPlatform,
+            StreamingPlatform.id == ViewingSession.platform_id,
+        )
+        .where(
+            WatchProgress.profile_id == profile.id,
+            ViewingSession.platform_id.in_(platform_ids),
+            StreamingPlatform.is_active.is_(True),
+        )
+        .order_by(
+            WatchProgress.last_watched_at.desc(),
+            WatchProgress.tmdb_id.desc(),
+        )
+        .limit(5)
+    ).all()
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=72)
+
+    eligible = []
+
+    for progress, platform in recent_rows:
+        if progress.status != "in_progress":
+            continue
+
+        if progress.last_watched_at is None:
+            continue
+
+        last_watched_at = progress.last_watched_at
+
+        # Support database timestamps that may be timezone-naive.
+        if last_watched_at.tzinfo is None:
+            last_watched_at = last_watched_at.replace(
+                tzinfo=timezone.utc
+            )
+
+        if last_watched_at < cutoff:
+            continue
+
+        if (
+            progress.progress_ratio is not None
+            and float(progress.progress_ratio) >= 0.90
+        ):
+            continue
+
+        if progress.media_type not in {"movie", "tv"}:
+            continue
+
+        eligible.append((progress, platform))
+
+    if not eligible:
+        return []
+
+    results = []
+    seen_titles = set()
+
+    with TMDBClient() as tmdb:
+        for progress, platform in eligible:
+            title_key = (
+                progress.media_type,
+                int(progress.tmdb_id),
+            )
+
+            if title_key in seen_titles:
+                continue
+
+            seen_titles.add(title_key)
+
+            try:
+                detail = tmdb.get(
+                    f"/{progress.media_type}/{progress.tmdb_id}"
+                )
+            except Exception:
+                logger.exception(
+                    "Continue Watching metadata lookup failed: "
+                    "media_type=%s tmdb_id=%s",
+                    progress.media_type,
+                    progress.tmdb_id,
+                )
+                continue
+
+            if not detail or not detail.get("id"):
+                continue
+
+            normalized = _normalise_title(
+                detail,
+                progress.media_type,
+            )
+
+            genres = detail.get("genres") or []
+
+            results.append({
+                "tmdb_id": normalized["tmdb_id"],
+                "media_type": normalized["media_type"],
+                "title": normalized["title"],
+                "release_date": normalized["release_date"],
+                "poster_url": normalized["poster_url"],
+                "backdrop_url": normalized["backdrop_url"],
+                "genre_ids": [
+                    genre["id"]
+                    for genre in genres
+                    if genre.get("id") is not None
+                ],
+                "genres": [
+                    genre["name"]
+                    for genre in genres
+                    if genre.get("name")
+                ],
+                "position_seconds": (
+                    float(progress.position_seconds)
+                    if progress.position_seconds is not None
+                    else 0.0
+                ),
+                "duration_seconds": (
+                    float(progress.duration_seconds)
+                    if progress.duration_seconds is not None
+                    else None
+                ),
+                "progress_ratio": (
+                    float(progress.progress_ratio)
+                    if progress.progress_ratio is not None
+                    else None
+                ),
+                "progress_percent": (
+                    round(float(progress.progress_ratio) * 100)
+                    if progress.progress_ratio is not None
+                    else None
+                ),
+                "season_number": progress.season_number,
+                "episode_number": progress.episode_number,
+                "last_watched_at": (
+                    progress.last_watched_at.isoformat()
+                    if progress.last_watched_at
+                    else None
+                ),
+                "platform": {
+                    "id": str(platform.id),
+                    "name": platform.name,
+                    "slug": platform.slug,
+                },
+            })
+
+    return results
+
+
+
 def get_unified_home(
     db: Session,
     account_id: UUID,
     profile: Profile,
 ) -> dict:
     """
-    Return the unified home page, available platforms, live TV,
-    shared content sliders, and dedicated content collections.
+    Return the unified home response.
+
+    TMDB title discovery is handled by the frontend.
+
+    The backend supplies:
+    - Discovery sources from entitled platforms.
+    - Profile preferences and section-specific defaults.
+    - Home slider templates.
+    - Continue Watching titles only.
+    - Available platforms and live-TV channels.
+
+    This function does not fetch movie, TV show, or cartoon
+    discovery collections from TMDB.
     """
 
     # -----------------------------------------------------
@@ -1084,24 +1745,19 @@ def get_unified_home(
     entitled_platform_ids = set()
     live_tv_enabled = False
 
-    # Only look up entitlements when a valid subscription and plan exist.
     if subscription is not None and plan is not None:
 
-        # Load platform IDs included in this plan.
         entitlement_platform_ids = db.scalars(
             select(PlanEntitlement.platform_id).where(
                 PlanEntitlement.plan_id == plan.id
             )
         ).all()
 
-        # Convert IDs to strings consistently because the access checks
-        # in the rest of this function also use string IDs.
         entitled_platform_ids = {
             str(platform_id)
             for platform_id in entitlement_platform_ids
         }
 
-        # Check whether live TV is enabled for this plan.
         live_tv_enabled = (
             db.scalar(
                 select(PlanFeature.is_enabled).where(
@@ -1113,7 +1769,7 @@ def get_unified_home(
         )
 
     # -----------------------------------------------------
-    # 3. Return every active platform with access status.
+    # 3. Return active platforms with their access status.
     # -----------------------------------------------------
     platforms = db.scalars(
         select(StreamingPlatform)
@@ -1125,13 +1781,13 @@ def get_unified_home(
     all_platforms = []
 
     for platform in platforms:
+
         is_available = (
             plan is not None
             and str(platform.id) in entitled_platform_ids
         )
 
         platform_availability[str(platform.id)] = is_available
-
 
         all_platforms.append({
             "id": str(platform.id),
@@ -1144,14 +1800,13 @@ def get_unified_home(
             ),
         })
 
-    # Only active platforms actually included in the plan are
-    # allowed to contribute subscription-based content.
+    # Only entitled, active platforms contribute discovery sources
+    # and Continue Watching records.
     entitled_platforms = [
         platform
         for platform in platforms
         if str(platform.id) in entitled_platform_ids
     ]
-
 
     # -----------------------------------------------------
     # 4. Return live-TV channels grouped by platform.
@@ -1179,12 +1834,10 @@ def get_unified_home(
 
         platform_id = str(channel_platform.id)
 
-        # A channel is available when its parent platform:
-        # 1. Is active.
-        # 2. Is included in the customer's subscription.
         channel_is_available = (
             channel_platform.is_active
             and platform_availability.get(platform_id, False)
+            and live_tv_enabled
         )
 
         if platform_id not in live_tv_by_platform:
@@ -1203,16 +1856,14 @@ def get_unified_home(
 
         live_tv_by_platform[platform_id]["channels"].append({
             "id": str(channel.id),
+            "channel_key": channel.channel_key,
             "name": channel.name,
             "logo_url": channel.logo_url,
-            "media_link": channel.stream_url,
-            "category": channel.category if channel.category else None,
-            "is_available": channel_is_available,
-            "availability_status": (
-                "available"
-                if channel_is_available
-                else "not_included"
-            ),
+            "stream_url": channel.stream_url,
+            "channel_number": channel.channel_number,
+            "display_order": channel.display_order,
+            "category": channel.category,
+            "is_news_channel": channel.is_news_channel,
         })
 
     live_tv_platforms = list(live_tv_by_platform.values())
@@ -1223,242 +1874,218 @@ def get_unified_home(
     )
 
     # -----------------------------------------------------
-    # 5. Define the nine shared home sliders.
+    # 5. Load the profile's learned preferences.
     # -----------------------------------------------------
-    today = date.today()
-    week_ago = today - timedelta(days=7)
+    profile_preferences = _get_section_preferences(profile)
 
-    shared_definitions = [
+    # Keep the two preference categories available separately.
+    genre_preferences = profile_preferences.get(
+        "genre_preferences", []
+    ) or []
+
+    keyword_preferences = profile_preferences.get(
+        "keyword_preferences", []
+    ) or []
+
+    has_profile_preferences = bool(
+        genre_preferences or keyword_preferences
+    )
+
+    profile_preference_source = (
+        "profile" if has_profile_preferences else "default"
+    )
+
+    # -----------------------------------------------------
+    # 6. Build discovery sources from entitled platforms.
+    # -----------------------------------------------------
+    source_groups = _build_unified_content_sources(
+        db=db,
+        platforms=entitled_platforms,
+    )
+
+    # Movies: watch providers and production companies.
+    movie_sources = _filter_content_sources(
+        source_groups=source_groups,
+        media_type="movie",
+    )
+
+    # TV Shows: watch providers and TV networks.
+    tv_sources = _filter_content_sources(
+        source_groups=source_groups,
+        media_type="tv",
+    )
+
+    # Cartoons: watch providers only.
+    # The frontend applies the mandatory Animation and Family
+    # genre filters separately.
+    cartoon_sources = []
+
+    for group in source_groups:
+        cartoon_sources.append({
+            "region_code": group["region_code"],
+            "language": group["language"],
+            "platforms": group["platforms"],
+            "watch_providers": group["watch_providers"],
+        })
+
+    # Home can use both movie and TV discovery sources.
+    home_sources = source_groups
+
+    # -----------------------------------------------------
+    # 7. Home defaults and slider templates.
+    # -----------------------------------------------------
+    home_default_preferences = {
+        "sort_by": "popularity.desc",
+        "include_adult": False,
+        "include_trending": True,
+    }
+
+    home_slider_templates = [
         {
             "key": "hero",
             "title": "Hero",
             "media_types": ["movie", "tv"],
-            "genres": [],
+            "genre_ids": [],
             "strategy": "popular",
-            "overrides": {"vote_count.gte": 50},
             "limit": 10,
         },
         {
             "key": "new_this_week",
             "title": "New This Week",
             "media_types": ["movie", "tv"],
-            "genres": [],
+            "genre_ids": [],
             "strategy": "newest",
-            "overrides": {
-                "primary_release_date.gte": week_ago.isoformat(),
-                "primary_release_date.lte": today.isoformat(),
-                "first_air_date.gte": week_ago.isoformat(),
-                "first_air_date.lte": today.isoformat(),
-            },
             "limit": 20,
         },
         {
             "key": "trending_now",
             "title": "Trending Now",
             "media_types": ["movie", "tv"],
-            "genres": [],
-            "strategy": "popular",
-            "overrides": {"vote_count.gte": 20},
+            "genre_ids": [],
+            "strategy": "trending",
             "limit": 20,
         },
         {
             "key": "top_picks_for_you",
             "title": "Top Picks for You",
             "media_types": ["movie", "tv"],
-            "genres": [],
-            "strategy": "top_picks",
-            "overrides": {"vote_count.gte": 10},
+            "genre_ids": [],
+            "strategy": "personalised",
             "limit": 20,
         },
         {
             "key": "action",
             "title": "Action",
             "media_types": ["movie", "tv"],
-            "genres": [28, 10759],
+            "genre_ids": [28, 10759],
             "strategy": "popular",
-            "overrides": {},
             "limit": 20,
         },
         {
             "key": "comedy",
             "title": "Comedy",
             "media_types": ["movie", "tv"],
-            "genres": [35],
+            "genre_ids": [35],
             "strategy": "popular",
-            "overrides": {},
             "limit": 20,
         },
         {
             "key": "sci_fi",
             "title": "Sci-Fi",
             "media_types": ["movie", "tv"],
-            "genres": [878, 10765],
+            "genre_ids": [878, 10765],
             "strategy": "popular",
-            "overrides": {},
             "limit": 20,
         },
         {
             "key": "thrillers",
             "title": "Thrillers",
             "media_types": ["movie"],
-            "genres": [53],
+            "genre_ids": [53],
             "strategy": "popular",
-            "overrides": {},
             "limit": 20,
         },
         {
             "key": "horror",
             "title": "Horror",
             "media_types": ["movie"],
-            "genres": [27],
+            "genre_ids": [27],
             "strategy": "popular",
-            "overrides": {},
             "limit": 20,
         },
     ]
 
-    home_sliders = []
-    movies = []
-    tv_shows = []
-    cartoons = []
-
-
     # -----------------------------------------------------
-    # 6. Discover the unified candidate pool ONCE.
+    # 8. Movies defaults and recommended queries.
     # -----------------------------------------------------
-
-    if entitled_platforms:
-
-        with TMDBClient() as tmdb:
-
-            candidate_pool = get_unified_candidate_pool(
-                db=db,
-                tmdb=tmdb,
-                platforms=entitled_platforms,
-                profile=profile,
-                movie_limit=100,
-                tv_limit=100,
-            )
-
-            # ---------------------------------------------
-            # Build all shared home sliders from candidates.
-            # ---------------------------------------------
-
-            for definition in shared_definitions:
-
-                results = build_collection_from_candidates(
-                    candidate_pool=candidate_pool,
-                    profile=profile,
-                    media_types=definition["media_types"],
-                    genre_ids=definition["genres"],
-                    overrides=definition["overrides"],
-                    strategy=definition["strategy"],
-                    page_size=definition["limit"],
-                )
-
-                home_sliders.append({
-                    "key": definition["key"],
-                    "title": definition["title"],
-                    "strategy": definition["strategy"],
-                    "media_scope": (
-                        "movies"
-                        if definition["media_types"] == ["movie"]
-                        else "mixed"
-                    ),
-                    "results": results,
-                })
-
-            # ---------------------------------------------
-            # Dedicated Movies collection.
-            # ---------------------------------------------
-
-            movies = build_collection_from_candidates(
-                candidate_pool=candidate_pool,
-                profile=profile,
-                media_types=["movie"],
-                strategy="popular",
-                page_size=30,
-            )
-
-            # ---------------------------------------------
-            # Dedicated TV Shows collection.
-            # ---------------------------------------------
-
-            tv_shows = build_collection_from_candidates(
-                candidate_pool=candidate_pool,
-                profile=profile,
-                media_types=["tv"],
-                strategy="popular",
-                page_size=30,
-            )
-
-            # ---------------------------------------------
-            # Dedicated Cartoons collection.
-            # ---------------------------------------------
-
-            cartoons = build_collection_from_candidates(
-                candidate_pool=candidate_pool,
-                profile=profile,
-                media_types=["movie", "tv"],
-                genre_ids=[16, 10751],
-                strategy="popular",
-                page_size=30,
-            )
-    # -----------------------------------------------------
-    # 7. Add platform-specific collections.
-    #    Shared sliders are not duplicated here.
-    # -----------------------------------------------------
-    shared_keys = {
-        item["key"] for item in shared_definitions
+    movie_default_preferences = {
+        "genre_ids": [],
+        "keyword_ids": [],
+        "sort_by": "popularity.desc",
+        "include_adult": False,
     }
 
-    for platform in entitled_platforms:
-        try:
-            platform_home = get_platform_home(
-                db=db,
-                platform_id=platform.id,
-                profile=profile,
-            )
-        except HTTPException as exc:
-            if exc.status_code in (400, 404):
-                continue
-            raise
-
-        for slider in platform_home.get("sliders", []):
-            slider_key = slider.get("key", "")
-
-            if slider_key in shared_keys:
-                continue
-
-            # Make each platform-specific key stable and readable,
-            # e.g. netflix_originals or disney_plus_originals.
-            safe_slug = platform.slug.replace("-", "_")
-            safe_slider_key = slider_key.replace("-", "_")
-            public_key = f"{safe_slug}_{safe_slider_key}"
-
-            attributed_results = []
-
-            for result in slider.get("results", []):
-                result = dict(result)
-
-                result["available_on"] = [{
-                    "platform_id": str(platform.id),
-                    "platform_name": platform.name,
-                    "platform_slug": platform.slug,
-                }]
-
-                attributed_results.append(result)
-
-            home_sliders.append({
-                **slider,
-                "key": public_key,
-                "platform_id": str(platform.id),
-                "platform_name": platform.name,
-                "results": attributed_results,
-            })
+    movie_queries = _build_recommended_queries(
+        source_groups=source_groups,
+        media_type="movie",
+        profile_preferences=profile_preferences,
+    )
 
     # -----------------------------------------------------
-    # 8. Return the complete response.
+    # 9. TV Shows defaults and recommended queries.
+    # -----------------------------------------------------
+    tv_default_preferences = {
+        "genre_ids": [],
+        "keyword_ids": [],
+        "sort_by": "popularity.desc",
+        "include_adult": False,
+    }
+
+    tv_queries = _build_recommended_queries(
+        source_groups=source_groups,
+        media_type="tv",
+        profile_preferences=profile_preferences,
+    )
+
+    # -----------------------------------------------------
+    # 10. Cartoons defaults and recommended queries.
+    # -----------------------------------------------------
+    cartoon_default_preferences = {
+        "movie_genre_ids": [16, 10751],
+        "tv_genre_ids": [16, 10751],
+        "sort_by": "popularity.desc",
+        "include_adult": False,
+    }
+
+    cartoon_movie_queries = _build_recommended_queries(
+        source_groups=source_groups,
+        media_type="movie",
+        profile_preferences=profile_preferences,
+        default_genre_ids=[16, 10751],
+    )
+
+    cartoon_tv_queries = _build_recommended_queries(
+        source_groups=source_groups,
+        media_type="tv",
+        profile_preferences=profile_preferences,
+        default_genre_ids=[16, 10751],
+    )
+
+    cartoon_preference_source = (
+        "mixed" if has_profile_preferences else "default"
+    )
+
+    # -----------------------------------------------------
+    # 11. Retrieve Continue Watching titles only.
+    # -----------------------------------------------------
+    continue_watching = _get_unified_continue_watching(
+        db=db,
+        platforms=entitled_platforms,
+        profile=profile,
+    )
+
+    # -----------------------------------------------------
+    # 12. Build the final response.
     # -----------------------------------------------------
     return {
         "user": {
@@ -1470,27 +2097,100 @@ def get_unified_home(
                 "Kids" if profile.is_kids_profile else "Adult"
             ),
         },
+
         "home": {
-            "sliders": home_sliders,
+            "profile_preferences": profile_preferences,
+            "default_preferences": home_default_preferences,
+            "preference_source": profile_preference_source,
+            "discovery_strategy": {
+                "media_types": ["movie", "tv"],
+                "title_fetching": "frontend",
+                "content_sources": home_sources,
+                "discovery_priorities": [
+                    "continue_watching",
+                    "profile_preferences",
+                    "trending",
+                    "popular",
+                ],
+                "slider_templates": home_slider_templates,
+            },
+            "continue_watching": continue_watching,
         },
+
         "all_platforms": all_platforms,
+
         "live_tv": {
+            "enabled": live_tv_enabled,
             "count": live_tv_channel_count,
             "platforms": live_tv_platforms,
         },
+
         "movies": {
-            "count": len(movies),
-            "results": movies,
+            "profile_preferences": profile_preferences,
+            "default_preferences": movie_default_preferences,
+            "preference_source": profile_preference_source,
+            "discovery_strategy": {
+                "media_type": "movie",
+                "title_fetching": "frontend",
+                "content_sources": movie_sources,
+                "discovery_priorities": [
+                    "profile_genres",
+                    "profile_keywords",
+                    "platform_production_companies",
+                    "popular",
+                    "top_rated",
+                    "new_releases",
+                ],
+                "recommended_queries": movie_queries,
+            },
         },
+
         "tv_shows": {
-            "count": len(tv_shows),
-            "results": tv_shows,
+            "profile_preferences": profile_preferences,
+            "default_preferences": tv_default_preferences,
+            "preference_source": profile_preference_source,
+            "discovery_strategy": {
+                "media_type": "tv",
+                "title_fetching": "frontend",
+                "content_sources": tv_sources,
+                "discovery_priorities": [
+                    "profile_genres",
+                    "profile_keywords",
+                    "platform_networks",
+                    "popular",
+                    "top_rated",
+                    "new_releases",
+                ],
+                "recommended_queries": tv_queries,
+            },
         },
+
         "cartoons": {
-            "count": len(cartoons),
-            "results": cartoons,
+            "profile_preferences": profile_preferences,
+            "default_preferences": cartoon_default_preferences,
+            "preference_source": cartoon_preference_source,
+            "discovery_strategy": {
+                "media_types": ["movie", "tv"],
+                "title_fetching": "frontend",
+                "content_sources": cartoon_sources,
+                "mandatory_genre_filters": {
+                    "movie": [16, 10751],
+                    "tv": [16, 10751],
+                },
+                "discovery_priorities": [
+                    "mandatory_cartoon_genres",
+                    "profile_preferences",
+                    "platform_watch_providers",
+                    "popular",
+                    "top_rated",
+                ],
+                "recommended_queries": (
+                    cartoon_movie_queries + cartoon_tv_queries
+                ),
+            },
         },
     }
+
 
 def get_unified_candidate_pool(
     db: Session,

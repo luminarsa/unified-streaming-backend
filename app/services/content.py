@@ -1743,7 +1743,6 @@ def get_unified_home(
     # 2. Determine included platforms and features.
     # -----------------------------------------------------
     entitled_platform_ids = set()
-    live_tv_enabled = False
 
     if subscription is not None and plan is not None:
 
@@ -1757,17 +1756,6 @@ def get_unified_home(
             str(platform_id)
             for platform_id in entitlement_platform_ids
         }
-
-        live_tv_enabled = (
-            db.scalar(
-                select(PlanFeature.is_enabled).where(
-                    PlanFeature.plan_id == plan.id,
-                    PlanFeature.feature_code == "live_tv",
-                )
-            )
-            is True
-        )
-
     # -----------------------------------------------------
     # 3. Return active platforms with their access status.
     # -----------------------------------------------------
@@ -1837,7 +1825,6 @@ def get_unified_home(
         channel_is_available = (
             channel_platform.is_active
             and platform_availability.get(platform_id, False)
-            and live_tv_enabled
         )
 
         if platform_id not in live_tv_by_platform:
@@ -1867,6 +1854,10 @@ def get_unified_home(
         })
 
     live_tv_platforms = list(live_tv_by_platform.values())
+    live_tv_enabled = any(
+        platform["is_available"]
+        for platform in live_tv_platforms
+    )
 
     live_tv_channel_count = sum(
         len(platform["channels"])

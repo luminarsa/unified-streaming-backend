@@ -1,9 +1,7 @@
 
 from typing import Any, Literal
-
-from pydantic import BaseModel, Field
 from uuid import UUID
-
+from pydantic import BaseModel, Field, model_validator
 
 # ---------------------------------------------------------
 # STREAMING PLATFORM
@@ -174,3 +172,36 @@ class PlatformLiveChannelCreate(BaseModel):
 
 class AvatarCreate(BaseModel):
     url: str
+
+
+class PlatformOriginalSourceCreate(BaseModel):
+    source_type: Literal[
+        "production_company",
+        "network",
+        "keyword",
+        "curated_title",
+    ]
+
+    tmdb_id: int = Field(gt=0)
+
+    name: str = Field(min_length=1, max_length=255)
+
+    media_type: Literal["movie", "tv"] | None = None
+
+    include_in_discovery: bool = True
+
+    confidence: str = Field(default="verified", max_length=20)
+
+    @model_validator(mode="after")
+    def validate_media_type(self):
+        if self.source_type == "curated_title":
+            if self.media_type is None:
+                raise ValueError(
+                    "media_type must be either 'movie' or 'tv' for curated titles."
+                )
+        elif self.media_type is not None:
+            raise ValueError(
+                "media_type must be omitted for production companies, networks and keywords."
+            )
+
+        return self

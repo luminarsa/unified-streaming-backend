@@ -1,5 +1,6 @@
+from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -120,6 +121,10 @@ def login(
 @router.post("/select-profile")
 def select_profile_endpoint(
     request: SelectProfileRequest,
+    device_installation_id: UUID = Header(
+        ...,
+        alias="X-Device-Installation-ID",
+    ),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ):
@@ -127,4 +132,5 @@ def select_profile_endpoint(
         db=db,
         raw_token=credentials.credentials,
         profile_id=request.profile_id,
+        device_installation_id=device_installation_id,
     )

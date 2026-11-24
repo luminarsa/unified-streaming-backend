@@ -12,6 +12,7 @@ from app.models.platform_config import (
     PlatformProvider,
     PlatformCompany,
     PlatformNetwork,
+    PlatformOriginalSource,
     SliderDefinition,
     PlatformNavigationItem,
     PlatformLiveChannel,
@@ -363,6 +364,103 @@ def list_platform_networks(db: Session, platform_id: UUID) -> list:
 
     return [_network_data(item) for item in networks]
 
+# ---------------------------------------------------------
+# PLATFORM ORIGINAL SOURCE SERVICES
+# ---------------------------------------------------------
+
+def _original_source_data(source: PlatformOriginalSource) -> dict:
+    return {
+        "id": str(source.id),
+        "platform_id": str(source.platform_id),
+        "source_type": source.source_type,
+        "tmdb_id": source.tmdb_id,
+        "name": source.name,
+        "media_type": source.media_type,
+        "include_in_discovery": source.include_in_discovery,
+        "confidence": source.confidence,
+        "created_at": (
+            source.created_at.isoformat()
+            if source.created_at else None
+        ),
+        "updated_at": (
+            source.updated_at.isoformat()
+            if source.updated_at else None
+        ),
+    }
+
+
+def create_platform_original_source(db: Session, platform_id: UUID, data) -> dict:
+    _require_platform(db, platform_id)
+
+    # Check whether this source already exists.
+    duplicate_query = select(PlatformOriginalSource).where(
+        PlatformOriginalSource.platform_id == platform_id,
+        PlatformOriginalSource.source_type == data.source_type,
+        PlatformOriginalSource.tmdb_id == data.tmdb_id,
+    )
+
+    if data.media_type is None:
+        duplicate_query = duplicate_query.where(
+            PlatformOriginalSource.media_type.is_(None)
+        )
+    else:
+        duplicate_query = duplicate_query.where(
+            PlatformOriginalSource.media_type == data.media_type
+        )
+
+    existing = db.scalar(duplicate_query)
+
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="This original source already exists for this platform.",
+        )
+
+    source = PlatformOriginalSource(
+        platform_id=platform_id,
+        **data.model_dump(),
+    )
+
+    db.add(source)
+
+    _commit(db, "This original source already exists for this platform.")
+
+    db.refresh(source)
+
+    return _original_source_data(source)
+
+
+def list_platform_original_sources(
+    db: Session,
+    platform_id: UUID,
+    source_type: str = None,
+    include_in_discovery: bool = None,
+) -> list:
+
+    _require_platform(db, platform_id)
+
+    query = select(PlatformOriginalSource).where(
+        PlatformOriginalSource.platform_id == platform_id
+    )
+
+    if source_type is not None:
+        query = query.where(
+            PlatformOriginalSource.source_type == source_type
+        )
+
+    if include_in_discovery is not None:
+        query = query.where(
+            PlatformOriginalSource.include_in_discovery == include_in_discovery
+        )
+
+    sources = db.scalars(
+        query.order_by(
+            PlatformOriginalSource.source_type,
+            PlatformOriginalSource.name,
+        )
+    ).all()
+
+    return [_original_source_data(item) for item in sources]
 
 # ---------------------------------------------------------
 # HOME PAGE SLIDER SERVICES

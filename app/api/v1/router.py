@@ -2,6 +2,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.auth import router as auth_router
+from app.api.v1 import devices
 from app.api.v1.account import router as account_router
 from app.api.v1.platforms_administration import router as platforms_administration_router
 from app.api.v1.platform_content import router as platform_content_router
@@ -22,6 +23,11 @@ api_router.include_router(slider_configuration_router)
 api_router.include_router(platforms_router)
 api_router.include_router(auth_router)
 api_router.include_router(account_router)
+api_router.include_router(
+    devices.router,
+    prefix="/devices",
+    tags=["Devices"],
+)
 api_router.include_router(telemetry_router)
 api_router.include_router(recommendations_router)
 api_router.include_router(subscriptions_router)

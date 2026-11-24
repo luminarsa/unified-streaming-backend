@@ -8,13 +8,21 @@ from datetime import timedelta
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-
-from app.models.identity import Account, AuthSession, Profile
+from fastapi import HTTPException, status
+from app.models.identity import (
+    Account,
+    AuthSession,
+    Profile,
+    RegisteredDevice,
+)
 from app.models.email_verification import EmailVerification
-
+from app.models.commercial import (
+    Subscription,
+    Plan,
+)
 from app.utils.auth import (
     hash_password,
     hash_token,
@@ -602,6 +610,186 @@ def login_account(
         raise
 
 
+def create_profile(
+    db: Session,
+    raw_token: str,
+    name: str,
+    avatar_url: str | None = None,
+    is_kids_profile: bool = False,
+) -> dict:
+    """
+    Create an additional profile for an authenticated account.
+
+    Profile limits:
+    - Minimum allowance: 5 profiles.
+    - Plans allowing 5 or more simultaneous streams:
+      profile limit matches simultaneous stream allowance.
+
+    Requires an active subscription.
+    """
+
+    # ---------------------------------------------
+    # 1. VALIDATE ACCESS TOKEN
+    # ---------------------------------------------
+
+    token_data = decode_access_token(
+        db=db,
+        raw_token=raw_token,
+    )
+
+    account_id = UUID(str(token_data["account_id"]))
+
+    # ---------------------------------------------
+    # 2. VALIDATE AUTHENTICATION SESSION
+    # ---------------------------------------------
+
+    current_time = now_utc()
+
+    session = db.scalar(
+        select(AuthSession).where(
+            AuthSession.token_hash == hash_token(raw_token),
+            AuthSession.account_id == account_id,
+        )
+    )
+
+    if (
+        session is None
+        or session.revoked_at is not None
+        or session.expires_at <= current_time
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Your session is no longer valid. Please sign in again.",
+        )
+
+    # ---------------------------------------------
+    # 3. LOCK ACCOUNT TO PREVENT RACE CONDITIONS
+    # ---------------------------------------------
+
+    account = db.scalar(
+        select(Account)
+        .where(Account.id == account_id)
+        .with_for_update()
+    )
+
+    if account is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Account not found.",
+        )
+
+    if account.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account is not active.",
+        )
+
+    try:
+
+        # -----------------------------------------
+        # 4. FIND ACTIVE SUBSCRIPTION AND PLAN
+        # -----------------------------------------
+
+        subscription_data = db.execute(
+            select(Subscription, Plan)
+            .join(
+                Plan,
+                Plan.id == Subscription.plan_id,
+            )
+            .where(
+                Subscription.account_id == account_id,
+                Subscription.status == "active",
+                Plan.is_active.is_(True),
+            )
+            .order_by(
+                Subscription.created_at.desc()
+            )
+        ).first()
+
+        if subscription_data is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "ACTIVE_SUBSCRIPTION_REQUIRED",
+                    "message": "An active subscription is required to create additional profiles.",
+                },
+            )
+
+        subscription, plan = subscription_data
+
+        # -----------------------------------------
+        # 5. CALCULATE PROFILE LIMIT
+        # -----------------------------------------
+
+        max_profiles = max(
+            5,
+            plan.max_simultaneous_streams,
+        )
+
+        # -----------------------------------------
+        # 6. COUNT EXISTING PROFILES
+        # -----------------------------------------
+
+        current_profiles = db.scalar(
+            select(func.count(Profile.id)).where(
+                Profile.account_id == account_id,
+            )
+        ) or 0
+
+        if current_profiles >= max_profiles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "PROFILE_LIMIT_REACHED",
+                    "message": "You have reached the maximum number of profiles allowed by your subscription.",
+                    "current_profiles": current_profiles,
+                    "max_profiles": max_profiles,
+                    "plan": plan.name,
+                },
+            )
+
+        # -----------------------------------------
+        # 7. CREATE PROFILE
+        # -----------------------------------------
+
+        profile = Profile(
+            account_id=account_id,
+            name=name,
+            avatar_key=avatar_url,
+            is_kids_profile=is_kids_profile,
+            preferences={},
+        )
+
+        db.add(profile)
+        db.commit()
+        db.refresh(profile)
+
+        # -----------------------------------------
+        # 8. RETURN PROFILE INFORMATION
+        # -----------------------------------------
+
+        return {
+            "success": True,
+            "message": "Profile created successfully.",
+            "data": {
+                "id": profile.id,
+                "account_id": profile.account_id,
+                "name": profile.name,
+                "avatar_url": profile.avatar_key,
+                "is_kids_profile": profile.is_kids_profile,
+                "created_at": profile.created_at,
+            },
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception:
+        db.rollback()
+        raise
+
+
 # -------------------------------------------------
 # PROFILE SELECTION
 # -------------------------------------------------
@@ -609,15 +797,86 @@ def login_account(
 def select_profile(
     db: Session,
     raw_token: str,
-    profile_id,
+    profile_id: UUID,
+    device_installation_id: UUID,
 ) -> dict:
+    """
+    Select a profile for the authenticated account.
+
+    The installation must be registered to the account.
+
+    If the device has a profile lock, only its assigned
+    profile can be selected.
+    """
+
+    # ---------------------------------------------
+    # 1. Validate account-level access token
+    # ---------------------------------------------
 
     token_data = decode_access_token(
         db=db,
         raw_token=raw_token,
     )
 
-    account_id = token_data["account_id"]
+    account_id = UUID(str(token_data["account_id"]))
+
+    # ---------------------------------------------
+    # 2. Validate the existing account session
+    # ---------------------------------------------
+
+    old_session = db.scalar(
+        select(AuthSession).where(
+            AuthSession.token_hash == hash_token(raw_token),
+            AuthSession.account_id == account_id,
+        )
+    )
+
+    if old_session is None or old_session.revoked_at is not None:
+        raise HTTPException(
+            status_code=401,
+            detail="Your session is no longer valid.",
+        )
+
+    # ---------------------------------------------
+    # 3. Find registered device
+    # ---------------------------------------------
+
+    device = db.scalar(
+        select(RegisteredDevice).where(
+            RegisteredDevice.account_id == account_id,
+            RegisteredDevice.device_installation_id == device_installation_id,
+        )
+    )
+
+    if not device.is_name_confirmed:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "DEVICE_NAME_REQUIRED",
+                "message": "Please provide a name for this device before selecting a profile.",
+            },
+        )
+
+    # ---------------------------------------------
+    # 4. Enforce device profile lock
+    # ---------------------------------------------
+
+    if (
+        device.locked_profile_id is not None
+        and device.locked_profile_id != profile_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "DEVICE_PROFILE_LOCKED",
+                "message": "This device is locked to another profile.",
+                "locked_profile_id": str(device.locked_profile_id),
+            },
+        )
+
+    # ---------------------------------------------
+    # 5. Verify profile belongs to account
+    # ---------------------------------------------
 
     profile = db.scalar(
         select(Profile).where(
@@ -633,17 +892,9 @@ def select_profile(
         )
 
     try:
-        old_session = db.scalar(
-            select(AuthSession).where(
-                AuthSession.token_hash == hash_token(raw_token)
-            )
-        )
-
-        if old_session is None or old_session.revoked_at is not None:
-            raise HTTPException(
-                status_code=401,
-                detail="Your session is no longer valid.",
-            )
+        # -----------------------------------------
+        # 6. Issue profile-specific access token
+        # -----------------------------------------
 
         new_token, new_token_hash, expires_at = issue_access_token(
             account_id=account_id,
@@ -657,6 +908,10 @@ def select_profile(
             expires_at=expires_at,
             last_seen_at=now_utc(),
         )
+
+        # -----------------------------------------
+        # 7. Revoke previous account-level session
+        # -----------------------------------------
 
         old_session.revoked_at = now_utc()
         old_session.revoked_reason = "profile_selected"

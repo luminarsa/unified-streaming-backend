@@ -13,6 +13,7 @@ from app.schemas.platform import (
     PlatformProviderCreate,
     PlatformCompanyCreate,
     PlatformNetworkCreate,
+    PlatformOriginalSourceCreate,
     SliderCreate,
     SliderUpdate,
     PlatformNavigationCreate,
@@ -34,6 +35,8 @@ from app.services.platform import (
     list_platform_companies,
     create_platform_network,
     list_platform_networks,
+    create_platform_original_source,
+    list_platform_original_sources,
     create_slider,
     list_platform_sliders,
     update_slider,
@@ -183,6 +186,39 @@ def get_platform_network_mappings(
 ):
     return list_platform_networks(db, platform_id)
 
+# --------------------------------------------------
+# PLATFORM ORIGINAL SOURCES
+# --------------------------------------------------
+
+@router.post(
+    "/{platform_id}/original-sources",
+    status_code=status.HTTP_201_CREATED,
+)
+def create_new_platform_original_source(
+    platform_id: UUID,
+    data: PlatformOriginalSourceCreate,
+    db: Session = Depends(get_db),
+):
+    return create_platform_original_source(
+        db,
+        platform_id,
+        data,
+    )
+
+
+@router.get("/{platform_id}/original-sources")
+def get_platform_original_sources(
+    platform_id: UUID,
+    source_type: str = None,
+    include_in_discovery: bool = None,
+    db: Session = Depends(get_db),
+):
+    return list_platform_original_sources(
+        db,
+        platform_id,
+        source_type=source_type,
+        include_in_discovery=include_in_discovery,
+    )
 
 # --------------------------------------------------
 # HOME PAGE SLIDERS

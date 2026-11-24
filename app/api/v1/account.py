@@ -1,17 +1,22 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
-from fastapi import Depends, HTTPException
-from fastapi import Depends, APIRouter
+
+from fastapi import Depends, HTTPException, APIRouter, Header
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-
+from app.schemas.auth import (
+    ProfileCreateRequest,
+    ProfileCreateResponse,
+)
+from fastapi import HTTPException, status
 from app.db.session import get_db
-from app.models.identity import Account, Profile
+from app.models.identity import Account, Profile, RegisteredDevice
 from app.models.commercial import Plan, PlanEntitlement, Subscription
 from app.models.platform_config import StreamingPlatform
 from app.utils.auth import decode_access_token
+from app.services.auth import create_profile
 
 bearer_scheme = HTTPBearer()
 
@@ -21,17 +26,19 @@ router = APIRouter(
 )
 
 
+
 @router.get("/profiles")
 def get_account_profiles(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    device_installation_id: UUID = Header(
+        ...,
+        alias="X-Device-Installation-ID",
+    ),
     db: Session = Depends(get_db),
 ):
-    # 1. Decode and validate the bearer token.
-    if credentials is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication is required.",
-        )
+    # ---------------------------------------------
+    # 1. Decode and validate bearer token
+    # ---------------------------------------------
 
     token_data = decode_access_token(
         db=db,
@@ -46,7 +53,10 @@ def get_account_profiles(
             detail="Invalid account identity in access token.",
         )
 
-    # 2. Fetch the account.
+    # ---------------------------------------------
+    # 2. Fetch account
+    # ---------------------------------------------
+
     account = db.get(Account, account_id)
 
     if account is None:
@@ -55,13 +65,75 @@ def get_account_profiles(
             detail="Account not found.",
         )
 
-    # 3. Fetch all profiles belonging to the account.
-    profiles = (
+    # ---------------------------------------------
+    # 3. Identify registered device
+    # ---------------------------------------------
+
+    device = db.scalar(
+        select(RegisteredDevice).where(
+            RegisteredDevice.account_id == account_id,
+            RegisteredDevice.device_installation_id == device_installation_id,
+        )
+    )
+
+    if not device.is_name_confirmed:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "DEVICE_NAME_REQUIRED",
+                "message": "Please provide a name for this device before loading profiles.",
+                "device_id": str(device.id),
+            },
+        )
+
+    # Update device last-seen timestamp.
+    device.last_seen_at = datetime.now(timezone.utc)
+    db.commit()
+
+    # ---------------------------------------------
+    # 4. Fetch all account profiles
+    # ---------------------------------------------
+
+    all_profiles = (
         db.query(Profile)
         .filter(Profile.account_id == account_id)
         .order_by(Profile.created_at.asc())
         .all()
     )
+
+    total_profile_count = len(all_profiles)
+
+    # ---------------------------------------------
+    # 5. Apply device profile lock
+    # ---------------------------------------------
+
+    if device.locked_profile_id is not None:
+
+        profiles = [
+            profile
+            for profile in all_profiles
+            if profile.id == device.locked_profile_id
+        ]
+
+        if not profiles:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "LOCKED_PROFILE_UNAVAILABLE",
+                    "message": (
+                        "The profile assigned to this device "
+                        "is no longer available. The account "
+                        "owner must update the device lock."
+                    ),
+                },
+            )
+
+    else:
+        profiles = all_profiles
+
+    # ---------------------------------------------
+    # 6. Format profiles
+    # ---------------------------------------------
 
     profile_list = [
         {
@@ -75,7 +147,10 @@ def get_account_profiles(
         for profile in profiles
     ]
 
-    # 4. Find the account's subscriptions, newest first.
+    # ---------------------------------------------
+    # 7. Find account subscription
+    # ---------------------------------------------
+
     subscriptions = (
         db.query(Subscription)
         .filter(Subscription.account_id == account_id)
@@ -118,96 +193,64 @@ def get_account_profiles(
         subscriptions[0] if subscriptions else None,
     )
 
-    subscription_info = None
+    # ---------------------------------------------
+    # 8. Calculate account limits from its plan
+    # ---------------------------------------------
+
     profile_limit = 0
     simultaneous_streams_limit = 0
     has_active_access = False
 
-    # 5. Fetch the plan and its included platforms.
     if subscription is not None:
+
         plan = db.get(Plan, subscription.plan_id)
 
         if plan is not None:
-            has_active_access = has_subscription_access(subscription)
 
-            simultaneous_streams_limit = (
-                plan.max_simultaneous_streams
+            has_active_access = has_subscription_access(
+                subscription
             )
 
-            # For now, profile creation is limited to the stream
-            # allowance only when the subscription grants access.
-            profile_limit = (
-                simultaneous_streams_limit
-                if has_active_access
-                else 0
-            )
+            if has_active_access:
 
-            included_platforms = (
-                db.query(StreamingPlatform)
-                .join(
-                    PlanEntitlement,
-                    PlanEntitlement.platform_id
-                    == StreamingPlatform.id,
+                simultaneous_streams_limit = (
+                    plan.max_simultaneous_streams
                 )
-                .filter(
-                    PlanEntitlement.plan_id == plan.id,
-                    StreamingPlatform.is_active.is_(True),
+
+                # Profile limit cannot exceed five or the
+                # plan's simultaneous stream allowance.
+                profile_limit = min(
+                    5,
+                    simultaneous_streams_limit,
                 )
-                .order_by(StreamingPlatform.display_order.asc())
-                .all()
-            )
 
-            subscription_info = {
-                "id": str(subscription.id),
-                "plan": {
-                    "id": str(plan.id),
-                    "code": plan.code,
-                    "name": plan.name,
-                    "price": (
-                        f"{plan.currency} "
-                        f"{Decimal(str(plan.price_minor)) / Decimal('100'):.2f}"
-                    ),
-                    "price_minor": int(plan.price_minor),
-                    "currency": plan.currency,
-                    "billing_interval": plan.billing_interval,
-                },
-                "billing_period": {
-                    "start_date": (
-                        subscription.current_period_start.isoformat()
-                        if subscription.current_period_start
-                        else None
-                    ),
-                    "end_date": (
-                        subscription.current_period_end.isoformat()
-                        if subscription.current_period_end
-                        else None
-                    ),
-                },
-                "status": subscription.status,
-                "has_active_access": has_active_access,
-                "cancel_at_period_end": (
-                    subscription.cancel_at_period_end
-                ),
-                "simultaneous_streams_limit": (
-                    simultaneous_streams_limit
-                ),
-                "platforms_included": [
-                    {
-                        "id": str(platform.id),
-                        "name": platform.name,
-                        "slug": platform.slug,
-                    }
-                    for platform in included_platforms
-                ],
-            }
+    # ---------------------------------------------
+    # 9. Return account, device and profile details
+    # ---------------------------------------------
 
-    # 6. Return the complete account overview.
     return {
+        "device": {
+            "id": str(device.id),
+            "device_installation_id": str(
+                device.device_installation_id
+            ),
+            "device_name": device.device_name,
+            "device_type": device.device_type,
+            "is_profile_locked": (
+                device.locked_profile_id is not None
+            ),
+            "locked_profile_id": (
+                str(device.locked_profile_id)
+                if device.locked_profile_id
+                else None
+            ),
+        },
         "profiles": {
             "count": len(profile_list),
             "profile_limit": profile_limit,
             "remaining_slots": max(
-                0, profile_limit - len(profile_list)
+                0,
+                profile_limit - total_profile_count,
             ),
             "profiles": profile_list,
         },
@@ -216,13 +259,35 @@ def get_account_profiles(
             "email": account.email,
             "status": account.status,
         },
-        "subscription": subscription_info,
         "access": {
             "has_active_subscription": has_active_access,
             "simultaneous_streams_limit": (
                 simultaneous_streams_limit
-                if has_active_access
-                else 0
             ),
         },
     }
+
+
+
+# =================================================
+# CREATE ADDITIONAL PROFILE
+# =================================================
+
+@router.post(
+    "/account/profiles",
+    status_code=status.HTTP_201_CREATED,
+    response_model=ProfileCreateResponse,
+)
+def create_profile_endpoint(
+    request: ProfileCreateRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+):
+
+    return create_profile(
+        db=db,
+        raw_token=credentials.credentials,
+        name=request.name,
+        avatar_url=request.avatar_url,
+        is_kids_profile=request.is_kids_profile,
+    )

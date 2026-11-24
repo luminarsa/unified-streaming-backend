@@ -10,6 +10,9 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from typing import Literal
+
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 # =================================================
@@ -36,6 +39,46 @@ class PrimaryProfileCreate(BaseModel):
 
         return value
 
+class ProfileCreateRequest(BaseModel):
+
+    name: str = Field(min_length=1, max_length=60)
+
+    is_kids_profile: bool = False
+
+    avatar_url: str | None = Field(
+        default=None,
+        max_length=500,
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Profile name cannot be empty.")
+
+        return value
+
+
+class ProfileCreateResponseData(BaseModel):
+
+    id: UUID
+    account_id: UUID
+
+    name: str
+    avatar_url: str | None
+
+    is_kids_profile: bool
+
+    created_at: datetime
+
+
+class ProfileCreateResponse(BaseModel):
+
+    success: bool
+    message: str
+    data: ProfileCreateResponseData
 
 class RegisterRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
@@ -254,3 +297,150 @@ class CurrentSubscriptionResponse(BaseModel):
 
 class SelectPlanRequest(BaseModel):
     plan_code: str = Field(min_length=2, max_length=40)
+
+
+# =================================================
+# DEVICE REGISTRATION
+# =================================================
+
+
+class DeviceRegisterRequest(BaseModel):
+    device_installation_id: UUID
+    device_type: str = Field(min_length=2, max_length=30)
+
+    @field_validator("device_type")
+    @classmethod
+    def clean_device_type(cls, value: str) -> str:
+        value = value.strip().lower()
+
+        if not value:
+            raise ValueError("Device type cannot be empty.")
+
+        return value
+
+
+class DeviceResponse(BaseModel):
+    id: UUID
+    device_installation_id: UUID
+    device_name: str
+    device_type: str
+    is_name_confirmed: bool
+    locked_profile_id: UUID | None = None
+    locked_profile: ProfileSummary | None = None
+    last_seen_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DeviceRegisterResponse(BaseModel):
+    success: bool
+    message: str
+    requires_name: bool
+    device: DeviceResponse
+
+class DeviceListResponse(BaseModel):
+    devices: list[DeviceResponse]
+    total_devices: int
+
+
+# =================================================
+# DEVICE MANAGEMENT
+# =================================================
+
+class RenameDeviceRequest(BaseModel):
+    device_name: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+
+    @field_validator("device_name")
+    @classmethod
+    def clean_device_name(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Device name cannot be empty.")
+
+        return value
+
+
+class RenameDeviceResponse(BaseModel):
+    success: bool
+    message: str
+    device: DeviceResponse
+
+
+# =================================================
+# PROFILE LOCK MANAGEMENT
+# =================================================
+
+class SetDeviceProfileLockRequest(BaseModel):
+    # Supply a profile UUID to lock the device.
+    # Supply null to remove the existing lock.
+    profile_id: UUID | None = None
+
+    # Short-lived authorization grant issued after PIN verification.
+    authorization_grant: str = Field(
+        min_length=20,
+        max_length=2000,
+    )
+
+
+class SetDeviceProfileLockResponse(BaseModel):
+    success: bool
+    message: str
+    device: DeviceResponse
+
+
+# =================================================
+# PROFILE LOCK PIN
+# =================================================
+
+class CreateProfileLockPinRequest(BaseModel):
+    pin: str = Field(
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$",
+    )
+
+
+class ChangeProfileLockPinRequest(BaseModel):
+    current_pin: str = Field(
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$",
+    )
+
+    new_pin: str = Field(
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$",
+    )
+
+
+class ProfileLockPinResponse(BaseModel):
+    success: bool
+    message: str
+
+
+class VerifyProfileLockPinRequest(BaseModel):
+    pin: str = Field(
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$",
+    )
+
+    device_id: UUID
+
+    operation: Literal["set_profile_lock"]
+
+
+class VerifyProfileLockPinResponse(BaseModel):
+    success: bool
+    message: str
+
+    authorization_grant: str
+
+    expires_in_seconds: int

@@ -1,5 +1,11 @@
-from app.models.identity import Account, Profile, AuthSession
-
+from app.models.identity import (
+    Account,
+    Profile,
+    AuthSession,
+    Avatar,
+    RegisteredDevice,
+    ProfileLockAuthorizationGrant,
+)
 from app.models.commercial import (
     Plan,
     PlanFeature,

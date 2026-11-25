@@ -291,3 +291,176 @@ def create_profile_endpoint(
         avatar_url=request.avatar_url,
         is_kids_profile=request.is_kids_profile,
     )
+
+
+
+@router.get("/web-profiles")
+def get_web_account_profiles(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+):
+    # ---------------------------------------------
+    # 1. Decode and validate bearer token
+    # ---------------------------------------------
+
+    token_data = decode_access_token(
+        db=db,
+        raw_token=credentials.credentials,
+    )
+
+    try:
+        account_id = UUID(str(token_data["account_id"]))
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid account identity in access token.",
+        )
+
+    # ---------------------------------------------
+    # 2. Fetch account
+    # ---------------------------------------------
+
+    account = db.get(Account, account_id)
+
+    if account is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Account not found.",
+        )
+
+    # ---------------------------------------------
+    # 3. Fetch all account profiles
+    # ---------------------------------------------
+
+    all_profiles = (
+        db.query(Profile)
+        .filter(Profile.account_id == account_id)
+        .order_by(Profile.created_at.asc())
+        .all()
+    )
+
+    # ---------------------------------------------
+    # 4. Format profiles
+    # ---------------------------------------------
+
+    profile_list = [
+        {
+            "id": str(profile.id),
+            "avatar": profile.avatar_key,
+            "name": profile.name,
+            "account_type": (
+                "Kids" if profile.is_kids_profile else "Adult"
+            ),
+        }
+        for profile in all_profiles
+    ]
+
+    total_profile_count = len(profile_list)
+
+    # ---------------------------------------------
+    # 5. Find account subscription
+    # ---------------------------------------------
+
+    subscriptions = (
+        db.query(Subscription)
+        .filter(Subscription.account_id == account_id)
+        .order_by(Subscription.created_at.desc())
+        .all()
+    )
+
+    now = datetime.now(timezone.utc)
+
+    def has_subscription_access(subscription):
+        if subscription.status != "active":
+            return False
+
+        if (
+            subscription.current_period_start is not None
+            and subscription.current_period_start > now
+        ):
+            return False
+
+        if (
+            subscription.current_period_end is not None
+            and subscription.current_period_end <= now
+        ):
+            return False
+
+        if (
+            subscription.cancel_at_period_end
+            and subscription.current_period_end is None
+        ):
+            return False
+
+        return True
+
+    # Prefer a subscription that currently grants access.
+    subscription = next(
+        (
+            item for item in subscriptions
+            if has_subscription_access(item)
+        ),
+        subscriptions[0] if subscriptions else None,
+    )
+
+    # ---------------------------------------------
+    # 6. Calculate account limits from its plan
+    # ---------------------------------------------
+
+    profile_limit = 0
+    simultaneous_streams_limit = 0
+    has_active_access = False
+
+    if subscription is not None:
+
+        plan = db.get(Plan, subscription.plan_id)
+
+        if plan is not None:
+
+            has_active_access = has_subscription_access(
+                subscription
+            )
+
+            if has_active_access:
+
+                simultaneous_streams_limit = (
+                    plan.max_simultaneous_streams
+                )
+
+                # Profile limit cannot exceed five or the
+                # plan's simultaneous stream allowance.
+                profile_limit = min(
+                    5,
+                    simultaneous_streams_limit,
+                )
+
+    # ---------------------------------------------
+    # 7. Return account and profile details
+    # ---------------------------------------------
+
+    return {
+        "profiles": {
+            "count": total_profile_count,
+            "profile_limit": profile_limit,
+            "remaining_slots": max(
+                0,
+                profile_limit - total_profile_count,
+            ),
+            "can_create_profile": (
+                has_active_access
+                and total_profile_count < profile_limit
+            ),
+            "profiles": profile_list,
+        },
+        "account": {
+            "id": str(account.id),
+            "email": account.email,
+            "status": account.status,
+        },
+        "access": {
+            "has_active_subscription": has_active_access,
+            "simultaneous_streams_limit": (
+                simultaneous_streams_limit
+            ),
+        },
+    }

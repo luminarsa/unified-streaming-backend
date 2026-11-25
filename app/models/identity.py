@@ -61,7 +61,12 @@ class Account(Base):
         Text,
         nullable=True,
     )
-
+    # Encrypted Profile Lock PIN.
+    # Used when the account owner needs to view their PIN.
+    profile_lock_pin_encrypted = Column(
+        Text,
+        nullable=True,
+    )
     profile_lock_pin_updated_at = Column(
         DateTime(timezone=True),
         nullable=True,

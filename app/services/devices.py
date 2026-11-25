@@ -1,4 +1,3 @@
-
 import os
 import secrets
 
@@ -16,7 +15,9 @@ from app.models.identity import (
     RegisteredDevice,
     ProfileLockAuthorizationGrant,
 )
-
+from app.services.profile_lock_pin_crypto import (
+    encrypt_profile_lock_pin,
+)
 from app.utils.auth import (
     hash_password,
     verify_password,
@@ -229,7 +230,6 @@ def delete_registered_device(
 # =========================================================
 # CREATE PROFILE LOCK PIN
 # =========================================================
-
 def create_profile_lock_pin(
     db: Session,
     account_id: UUID,
@@ -238,25 +238,34 @@ def create_profile_lock_pin(
     """
     Create the account-level Profile Lock PIN.
 
-    This operation only works when the account does not already
-    have a PIN configured.
+    Stores both:
+    - A one-way hash for PIN verification.
+    - An encrypted PIN for account-owner retrieval.
     """
 
     account = get_account_or_404(db, account_id)
 
     if account.profile_lock_pin_hash:
         raise HTTPException(
-            status_code=409,
+            status_code=status.HTTP_409_CONFLICT,
             detail="A Profile Lock PIN already exists. Use the change PIN operation.",
         )
 
-    account.profile_lock_pin_hash = hash_profile_lock_pin(pin)
-    account.profile_lock_pin_updated_at = now_utc()
+    try:
+        account.profile_lock_pin_hash = hash_profile_lock_pin(pin)
 
-    db.commit()
-    db.refresh(account)
+        account.profile_lock_pin_encrypted = encrypt_profile_lock_pin(pin)
 
-    return account
+        account.profile_lock_pin_updated_at = now_utc()
+
+        db.commit()
+        db.refresh(account)
+
+        return account
+
+    except Exception:
+        db.rollback()
+        raise
 
 
 # =========================================================

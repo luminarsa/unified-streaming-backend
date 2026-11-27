@@ -6,9 +6,25 @@ from app.core.config import settings
 from app.core.redis_client import check_redis_connection
 from app.api.v1.router import api_router
 from contextlib import asynccontextmanager
+from app.services.background_scheduler import (
+    start_background_jobs,
+    stop_background_jobs,
+)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    # Start background jobs when FastAPI starts.
+    background_tasks = start_background_jobs()
+
+    yield
+
+    # Stop background jobs when FastAPI shuts down.
+    await stop_background_jobs(background_tasks)
 
 app = FastAPI(
     title=settings.app_name,
+    lifespan=lifespan,
     description="Backend API for the unified streaming platform demo",
     version="1.0.0",
 )

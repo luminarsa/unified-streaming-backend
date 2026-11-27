@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # Generate this once and keep it in your .env file.
     payment_encryption_key: str = "qRTk8DYfz3tQweQg1kx2Mpe/N4MK/5OQkdeW0HVHQ+M="
 
+    # Card2Crypto
+    card2crypto_merchant_wallet: str = ""
+    public_backend_url: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore",

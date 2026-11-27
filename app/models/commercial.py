@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    Text,
     Numeric,
     String,
     UniqueConstraint,
@@ -31,6 +32,20 @@ class Plan(Base):
     currency = Column(String(3), default="ZAR", nullable=False)
     paypal_price = Column(Numeric(10, 2))
     paypal_currency = Column(String(3))
+    # Card2Crypto checkout configuration
+    card2crypto_enabled = Column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default="true",
+    )
+
+    card2crypto_minimum_usd = Column(
+        Numeric(12, 2),
+        nullable=False,
+        default=2.00,
+        server_default="2.00",
+    )
     billing_interval = Column(String(20), default="Monthly", nullable=False)
     max_simultaneous_streams = Column(Integer, nullable=False, default=1)
     is_active = Column(Boolean, default=True, nullable=False)
@@ -51,6 +66,105 @@ class Plan(Base):
             name="check_plan_currency_zar",
         ),
     )
+
+
+class Card2CryptoPayment(Base):
+    __tablename__ = "card2crypto_payments"
+
+    id = Column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+
+    # Lumina payment transaction.
+    payment_transaction_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("payment_transactions.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+
+    # Unique reference sent to Card2Crypto.
+    payment_reference = Column(
+        String(100),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+
+    # Card2Crypto receiving wallet information.
+    encrypted_address_in = Column(Text, nullable=False)
+    polygon_address_in = Column(String(100), nullable=False)
+
+    # Encrypted provider IPN token.
+    encrypted_ipn_token = Column(Text, nullable=False)
+
+    # Authentication for the callback URL.
+    callback_token_hash = Column(String(64), nullable=False)
+
+    # Original ZAR price and USD conversion.
+    zar_amount = Column(Numeric(12, 2), nullable=False)
+    usd_amount = Column(Numeric(12, 2), nullable=False)
+    exchange_rate = Column(Numeric(18, 8), nullable=False)
+
+    # Hosted checkout URL.
+    checkout_url = Column(Text, nullable=False)
+
+    # Provider payment information.
+    coin = Column(String(50))
+    value_coin = Column(Numeric(18, 8))
+    value_forwarded_coin = Column(Numeric(18, 8))
+
+    txid_in = Column(String(100))
+    txid_out = Column(String(100))
+
+    # Card2Crypto payment status.
+    status = Column(
+        String(30),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+    )
+
+    # Callback and reconciliation timestamps.
+    callback_received_at = Column(DateTime(timezone=True))
+    paid_at = Column(DateTime(timezone=True))
+    last_status_check_at = Column(DateTime(timezone=True))
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "zar_amount > 0",
+            name="check_card2crypto_zar_amount",
+        ),
+        CheckConstraint(
+            "usd_amount > 0",
+            name="check_card2crypto_usd_amount",
+        ),
+        CheckConstraint(
+            "exchange_rate > 0",
+            name="check_card2crypto_exchange_rate",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'paid', 'failed', 'expired')",
+            name="check_card2crypto_status",
+        ),
+    )
+
 
 class PlanFeature(Base):
     __tablename__ = "plan_features"

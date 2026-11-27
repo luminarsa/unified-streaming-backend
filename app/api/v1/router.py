@@ -14,6 +14,7 @@ from app.api.v1.payments import router as payments_router
 from app.api.v1.paypal_webhooks import router as paypal_webhooks_router
 from app.api.v1.cache_refresh import router as cache_refresh_router
 from app.api.v1.slider_configuration import router as slider_configuration_router
+from app.api.v1.card2crypto import router as card2crypto_router
 
 api_router = APIRouter()
 
@@ -31,6 +32,7 @@ api_router.include_router(
 api_router.include_router(telemetry_router)
 api_router.include_router(recommendations_router)
 api_router.include_router(subscriptions_router)
+api_router.include_router(card2crypto_router)
 api_router.include_router(payments_router)
 api_router.include_router(paypal_webhooks_router)
 api_router.include_router(cache_refresh_router)
